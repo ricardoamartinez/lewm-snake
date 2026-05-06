@@ -482,7 +482,9 @@ def train_full(
                     z_flat = z_flat + dec_noise * torch.randn_like(z_flat)
                 raw = dec(z_flat)
                 pix_target = f.reshape(B * T_, 3, H, W)
-                dec_loss = oracle_decoder_loss(raw, pix_target, "cat-kmeans-unique",
+                # FOCAL CE on the K-means-unique palette: forces model to focus on
+                # rare classes (snake/food) instead of plateauing at BG-only.
+                dec_loss = oracle_decoder_loss(raw, pix_target, "cat-kmeans-focal",
                                                 K=K_PALETTE, palette=palette_t)
 
                 loss = pred_loss + sigreg_lambda * sigreg_loss + dec_loss

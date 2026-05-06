@@ -353,6 +353,7 @@ def train_arch_jepa(
     entropy_lambda: float = 0.0,  # entropy regularization on decoder output (penalizes hedged softmax)
     dec_kind: str = "convt",      # "convt" or "pixshuf"
     predictor_kind_override: str = "",  # "" = auto, "stoch-conv" = stochastic conv predictor
+    steps_per_epoch_cap: int = 0,  # if > 0, sample only this many batches per epoch (fast iter)
 ):
     """Full JEPA system with spatial latent: encoder + ConvPredictor + decoder.
     Trains on T-step windows with both pred MSE in latent space and dec CE in pixel space.
@@ -412,10 +413,16 @@ def train_arch_jepa(
     # Initialized to large value so unseen windows are always sampled at least once.
     priorities = torch.ones(len(windows), dtype=torch.float64) * 10.0
     sample_batch = batch * 2 if hard_mining == "topk2x" else batch
-    steps_per_epoch = len(windows) // sample_batch
+    natural_steps = len(windows) // sample_batch
+    steps_per_epoch = steps_per_epoch_cap if steps_per_epoch_cap > 0 else natural_steps
+    samples_per_epoch = steps_per_epoch * sample_batch
     if hard_mining == "prio":
         # WeightedRandomSampler is rebuilt each epoch with current priorities
         loader = None
+    elif steps_per_epoch_cap > 0:
+        # Use weighted sampler with uniform weights to subsample fixed N per epoch
+        from torch.utils.data import WeightedRandomSampler
+        loader = None  # built per epoch with fresh subsample
     else:
         loader = DataLoader(
             WMSet(), batch_size=sample_batch, shuffle=True, num_workers=4,
@@ -540,13 +547,21 @@ def train_arch_jepa(
         total = {"loss": 0.0, "pred": 0.0, "dec": 0.0}; n = 0
         ep_t0 = time.time()
 
-        # For prio mode, rebuild loader each epoch with current priorities
+        # For prio mode (or capped subsample), rebuild loader each epoch
         if hard_mining == "prio":
             from torch.utils.data import WeightedRandomSampler
             weights = priorities ** prio_alpha
-            sampler = WeightedRandomSampler(weights.numpy(), num_samples=len(windows), replacement=True)
+            sampler = WeightedRandomSampler(weights.numpy(), num_samples=samples_per_epoch, replacement=True)
             ep_loader = DataLoader(
                 WMSet(), batch_size=batch, sampler=sampler, num_workers=4,
+                drop_last=True, pin_memory=True, persistent_workers=False,
+            )
+        elif steps_per_epoch_cap > 0:
+            # Uniform random subsample of fixed N per epoch
+            from torch.utils.data import RandomSampler
+            sampler = RandomSampler(WMSet(), replacement=True, num_samples=samples_per_epoch)
+            ep_loader = DataLoader(
+                WMSet(), batch_size=sample_batch, sampler=sampler, num_workers=4,
                 drop_last=True, pin_memory=True, persistent_workers=False,
             )
         else:
@@ -613,11 +628,11 @@ def train_arch_jepa(
 # self-attention (true global). Combined with stochastic noise for commitment.
 ARCH_RUNS = [
     # (run_name,                  arch_kind,    dec_kind,  ent,  pred_override,        pred_blocks, pred_hidden)
-    ("rf2-stoch-control",         "spatial-32", "pixshuf", 0.3,  "stoch-conv",          2,           64),
-    ("rf2-deep-stoch",            "spatial-32", "pixshuf", 0.3,  "stoch-conv",          6,           128),
-    ("rf2-global-stoch",          "spatial-32", "pixshuf", 0.3,  "global-stoch-conv",   2,           64),
-    ("rf2-attn-stoch",            "spatial-32", "pixshuf", 0.3,  "attn-stoch",          2,           64),
-    ("rf2-attn-deep",             "spatial-32", "pixshuf", 0.3,  "attn",                4,           128),
+    ("rf3-stoch-control",         "spatial-32", "pixshuf", 0.3,  "stoch-conv",          2,           64),
+    ("rf3-deep-stoch",            "spatial-32", "pixshuf", 0.3,  "stoch-conv",          6,           128),
+    ("rf3-global-stoch",          "spatial-32", "pixshuf", 0.3,  "global-stoch-conv",   2,           64),
+    ("rf3-attn-stoch",            "spatial-32", "pixshuf", 0.3,  "attn-stoch",          2,           64),
+    ("rf3-attn-deep",             "spatial-32", "pixshuf", 0.3,  "attn",                4,           128),
 ]
 
 
@@ -1465,15 +1480,16 @@ def train_manifold(
 
 @app.local_entrypoint()
 def main():
-    print(f"Spawning {len(ARCH_RUNS)} parallel H100 jobs (RF fix, fast: ep < 60s) ...")
+    print(f"Spawning {len(ARCH_RUNS)} parallel H100 jobs (RF fix, full data + step cap) ...")
     for run_name, arch_kind, dec_kind, ent, pred_override, pb, phid in ARCH_RUNS:
         bs = 64 if arch_kind.startswith("spatial-64") else 128
         h = train_arch_jepa.spawn(
             run_name=run_name, arch_kind=arch_kind,
             rollout_dec=True, pred_lambda=0.0,
-            history=1, pred_horizon=24,
+            history=1, pred_horizon=32,           # full drift coverage
             latent_noise=0.01, batch=bs,
-            num_episodes=200,
+            num_episodes=1500,                    # full data → full food-event coverage
+            steps_per_epoch_cap=250,              # cap → fast iter (~50s/epoch)
             hard_mining="prio", prio_alpha=1.0,
             dec_kind=dec_kind, entropy_lambda=ent,
             predictor_kind_override=pred_override,

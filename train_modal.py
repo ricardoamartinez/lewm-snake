@@ -325,7 +325,7 @@ def train_predictor(
 
 @app.function(
     image=image,
-    gpu="A10G",
+    gpu="H100",
     volumes={CKPT_DIR: vol},
     timeout=60 * 60,
 )
@@ -521,15 +521,15 @@ def train_arch_jepa(
     print(f"[{run_name}] DONE in {time.time()-train_t0:.0f}s", flush=True)
 
 
-# Precision ablation v2: spatial-64 OOMs on A10G (full-res rollout). Push spatial-32
-# harder with deeper / wider variants. All pred_lambda=0, rollout dec_loss only.
+# Precision ablation v3 — H100 (80 GB) so we can do spatial-64 (pixel-perfect)
+# and bigCh variants. All pred_lambda=0, rollout dec_loss only.
 ARCH_RUNS = [
     # (run_name,                       arch_kind)
-    ("prec2-spatial-16",               "spatial-16"),
-    ("prec2-spatial-32",               "spatial-32"),
-    ("prec2-spatial-32-deep",          "spatial-32-deep"),
-    ("prec2-spatial-32-deep-bigCh",    "spatial-32-deep-bigCh"),
-    ("prec2-spatial-16-deep-bigCh",    "spatial-16-deep-bigCh"),
+    ("prec3-spatial-32",               "spatial-32"),
+    ("prec3-spatial-64",               "spatial-64"),               # 1 px per cell
+    ("prec3-spatial-32-deep",          "spatial-32-deep"),
+    ("prec3-spatial-64-deep",          "spatial-64-deep"),
+    ("prec3-spatial-32-deep-bigCh",    "spatial-32-deep-bigCh"),
 ]
 
 

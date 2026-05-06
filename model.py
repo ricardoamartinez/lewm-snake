@@ -379,6 +379,93 @@ class ConvPredictor(nn.Module):
         return z + self.out_proj(h)
 
 
+class GlobalConvPredictor(nn.Module):
+    """ConvPredictor + global-pool-broadcast at every block. Each spatial cell
+    sees the global mean of all cells in O(1), so info propagates everywhere
+    in a single forward pass. Fixes "predictor can't see food respawn position
+    on the other side of the map" without going to full self-attention.
+    """
+    def __init__(self, dim: int = 16, hidden: int = 64, n_blocks: int = 2, stochastic: bool = False, noise_dim: int = 8):
+        super().__init__()
+        self.dim = dim
+        self.stochastic = stochastic
+        self.noise_dim = noise_dim if stochastic else 0
+        self.in_proj = nn.Conv2d(dim + self.noise_dim, hidden, 3, 1, 1)
+        self.blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.GroupNorm(min(8, hidden), hidden), nn.GELU(),
+                nn.Conv2d(hidden, hidden, 3, 1, 1),
+                nn.GroupNorm(min(8, hidden), hidden), nn.GELU(),
+                nn.Conv2d(hidden, hidden, 3, 1, 1),
+            ) for _ in range(n_blocks)
+        ])
+        # Global pool->broadcast: aggregates all cells, sends back to each
+        self.globals = nn.ModuleList([nn.Linear(hidden, hidden) for _ in range(n_blocks)])
+        self.out_proj = nn.Conv2d(hidden, dim, 3, 1, 1)
+
+    def forward(self, z, action_emb, noise=None):
+        B, _, H, W = z.shape
+        a = action_emb.unsqueeze(-1).unsqueeze(-1)
+        if self.stochastic:
+            if noise is None:
+                noise = torch.randn(B, self.noise_dim, H, W, device=z.device, dtype=z.dtype)
+            x = torch.cat([z + a, noise], dim=1)
+        else:
+            x = z + a
+        h = self.in_proj(x)
+        for blk, gl in zip(self.blocks, self.globals):
+            h = h + blk(h)
+            g = h.mean(dim=(-2, -1))                                      # (B, hidden)
+            h = h + gl(g).unsqueeze(-1).unsqueeze(-1)                     # broadcast back
+        return z + self.out_proj(h)
+
+
+class AttnPredictor(nn.Module):
+    """Self-attention predictor: every spatial cell can attend to every other
+    cell in O(N^2). Strongest possible receptive field for predicting events
+    that depend on global state (food respawn, body length tracking, etc).
+    """
+    def __init__(self, dim: int = 16, hidden: int = 64, n_blocks: int = 2,
+                 num_heads: int = 4, stochastic: bool = False, noise_dim: int = 8,
+                 max_size: int = 64):
+        super().__init__()
+        self.dim = dim
+        self.hidden = hidden
+        self.stochastic = stochastic
+        self.noise_dim = noise_dim if stochastic else 0
+        self.in_proj = nn.Conv2d(dim + self.noise_dim, hidden, 1)
+        self.pos_embed = nn.Parameter(torch.randn(1, hidden, max_size, max_size) * 0.02)
+        self.blocks = nn.ModuleList([
+            nn.ModuleDict({
+                "norm1": nn.LayerNorm(hidden),
+                "attn": nn.MultiheadAttention(hidden, num_heads, batch_first=True),
+                "norm2": nn.LayerNorm(hidden),
+                "ff": nn.Sequential(nn.Linear(hidden, hidden * 2), nn.GELU(), nn.Linear(hidden * 2, hidden)),
+            }) for _ in range(n_blocks)
+        ])
+        self.out_proj = nn.Conv2d(hidden, dim, 1)
+
+    def forward(self, z, action_emb, noise=None):
+        B, _, H, W = z.shape
+        a = action_emb.unsqueeze(-1).unsqueeze(-1)
+        if self.stochastic:
+            if noise is None:
+                noise = torch.randn(B, self.noise_dim, H, W, device=z.device, dtype=z.dtype)
+            x = torch.cat([z + a, noise], dim=1)
+        else:
+            x = z + a
+        h = self.in_proj(x) + self.pos_embed[:, :, :H, :W]
+        # Flatten to tokens
+        tokens = h.flatten(2).transpose(1, 2)                              # (B, H*W, hidden)
+        for blk in self.blocks:
+            tn = blk["norm1"](tokens)
+            attn_out, _ = blk["attn"](tn, tn, tn, need_weights=False)
+            tokens = tokens + attn_out
+            tokens = tokens + blk["ff"](blk["norm2"](tokens))
+        h = tokens.transpose(1, 2).view(B, self.hidden, H, W)
+        return z + self.out_proj(h)
+
+
 class StochasticConvPredictor(nn.Module):
     """Stochastic JEPA conv predictor: samples a noise tensor each call so the
     network can output one concrete future rather than the AVERAGE over plausible

@@ -147,7 +147,8 @@ def run_arch_jepa_play(args, ckpt_path):
     from snake import Snake
     from model import (
         OracleEncoderCNN, TinyDecoder, SpatialEncoder, SpatialDecoder, SpatialPixShufDecoder,
-        ConvPredictor, StochasticConvPredictor, make_predictor, render_oracle_output,
+        ConvPredictor, StochasticConvPredictor, GlobalConvPredictor, AttnPredictor,
+        make_predictor, render_oracle_output,
     )
 
     blob = torch.load(ckpt_path, map_location="cpu", weights_only=False)
@@ -184,6 +185,14 @@ def run_arch_jepa_play(args, ckpt_path):
     dec.load_state_dict(blob["decoder_state"]); dec.eval()
     if pred_kind == "stoch-conv":
         pred = StochasticConvPredictor(dim=dim, hidden=64, n_blocks=2)
+    elif pred_kind == "global-conv":
+        pred = GlobalConvPredictor(dim=dim, hidden=64, n_blocks=2, stochastic=False)
+    elif pred_kind == "global-stoch-conv":
+        pred = GlobalConvPredictor(dim=dim, hidden=64, n_blocks=2, stochastic=True)
+    elif pred_kind == "attn":
+        pred = AttnPredictor(dim=dim, hidden=64, n_blocks=2, stochastic=False)
+    elif pred_kind == "attn-stoch":
+        pred = AttnPredictor(dim=dim, hidden=64, n_blocks=2, stochastic=True)
     else:
         pred = make_predictor(pred_kind, dim=dim)
     pred.load_state_dict(blob["predictor_state"]); pred.eval()

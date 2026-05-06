@@ -654,15 +654,16 @@ def train_arch_jepa(
 # stochastic predictor + entropy reg. Force commitment via discrete VQ codes:
 # predictor's continuous output is snapped to ONE of K codes per cell.
 # Different K and combos to find sweet spot.
-# Grid-size compare: best variants at both 64-cell (1px) and 16-cell (4px) games.
-# Play UI shows GT | AE | JEPA per run for full pipeline diagnosis.
+# 1:1 latent: spatial-64 → encoder produces a 64x64 latent (one vector per pixel).
+# No downsampling = no information lost = no blob possible structurally.
+# Play UI shows GT | ENC | DEC(AE) | JEPA per run.
 ARCH_RUNS = [
     # (run_name,            arch_kind,    dec_kind,  ent,  pred_override, pb, ph,  fsq_L, grid_cells)
-    ("g64-control",         "spatial-32", "pixshuf", 0.3,  "stoch-conv",   2, 64,  0,     64),
-    ("g64-fsq5",            "spatial-32", "pixshuf", 0.3,  "stoch-conv",   2, 64,  5,     64),
-    ("g16-control",         "spatial-32", "pixshuf", 0.3,  "stoch-conv",   2, 64,  0,     16),
-    ("g16-fsq5",            "spatial-32", "pixshuf", 0.3,  "stoch-conv",   2, 64,  5,     16),
-    ("g16-fsq3",            "spatial-32", "pixshuf", 0.3,  "stoch-conv",   2, 64,  3,     16),
+    ("p1-g64-control",      "spatial-64", "pixshuf", 0.3,  "stoch-conv",   2, 64,  0,     64),
+    ("p1-g64-fsq5",         "spatial-64", "pixshuf", 0.3,  "stoch-conv",   2, 64,  5,     64),
+    ("p1-g16-control",      "spatial-64", "pixshuf", 0.3,  "stoch-conv",   2, 64,  0,     16),
+    ("p1-g16-fsq5",         "spatial-64", "pixshuf", 0.3,  "stoch-conv",   2, 64,  5,     16),
+    ("p1-g16-fsq3",         "spatial-64", "pixshuf", 0.3,  "stoch-conv",   2, 64,  3,     16),
 ]
 
 
@@ -1510,23 +1511,26 @@ def train_manifold(
 
 @app.local_entrypoint()
 def main():
-    print(f"Spawning {len(ARCH_RUNS)} parallel H100 jobs (grid sizes 64 vs 16) ...")
+    print(f"Spawning {len(ARCH_RUNS)} parallel H100 jobs (1:1 latent: spatial-64) ...")
     for run_name, arch_kind, dec_kind, ent, pred_override, pb, phid, fsq_L, gc in ARCH_RUNS:
-        bs = 32 if arch_kind.startswith("spatial-64") else 64
+        # spatial-64 is heavy: full-res rollout. Smaller batch + fewer steps + shorter rollout.
+        bs = 16 if arch_kind.startswith("spatial-64") else 64
+        ph = 24 if arch_kind.startswith("spatial-64") else 32
+        cap = 200 if arch_kind.startswith("spatial-64") else 500
         h = train_arch_jepa.spawn(
             run_name=run_name, arch_kind=arch_kind,
             rollout_dec=True, pred_lambda=0.0,
-            history=1, pred_horizon=32,
+            history=1, pred_horizon=ph,
             latent_noise=0.01, batch=bs,
             num_episodes=1500,
-            steps_per_epoch_cap=500,
+            steps_per_epoch_cap=cap,
             hard_mining="prio", prio_alpha=1.0,
             dec_kind=dec_kind, entropy_lambda=ent,
             predictor_kind_override=pred_override,
             pred_blocks=pb, pred_hidden=phid,
             fsq_levels=fsq_L, grid_cells=gc,
         )
-        print(f"  spawned {run_name} (grid={gc}, pred={pred_override}, fsq_L={fsq_L}): {h.object_id}")
+        print(f"  spawned {run_name} (grid={gc}, arch={arch_kind}, fsq_L={fsq_L}, bs={bs}): {h.object_id}")
     print("All jobs spawned.")
     return
     # legacy entrypoint below

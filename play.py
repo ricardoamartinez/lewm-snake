@@ -819,6 +819,244 @@ def run_oracle_replay(args, ckpt_path):
     pygame.quit()
 
 
+def _build_arch_jepa_model(blob, device):
+    """Helper that builds enc/pred/dec/act_embed/vq from a checkpoint blob."""
+    import torch.nn as nn
+    from model import (
+        OracleEncoderCNN, TinyDecoder, SpatialEncoder, SpatialDecoder, SpatialPixShufDecoder,
+        ConvPredictor, StochasticConvPredictor, GlobalConvPredictor, AttnPredictor,
+        SpatialVQ, SpatialFSQ, make_predictor,
+    )
+    cfg = blob["cfg"]
+    arch = cfg["arch_kind"]; dim = cfg["dim"]; K = cfg["K"]
+    out_channels = cfg["out_channels"]
+    pred_kind = cfg["predictor_kind"]
+    palette = blob["palette"]
+    if not isinstance(palette, torch.Tensor): palette = torch.tensor(palette)
+
+    if arch == "flat":
+        enc = OracleEncoderCNN(in_channels=3, out_dim=dim)
+        dec = TinyDecoder(dim=dim, ch=128, out_channels=out_channels)
+    else:
+        parts = arch.split("-")
+        lat_size = int(parts[1])
+        deep = "deep" in parts
+        bigch = "bigCh" in parts
+        enc_refine = 3 if deep else 1
+        dec_refine = 3 if deep else 1
+        enc_base = 64 if bigch else 32
+        dec_base = 256 if bigch else 128
+        dec_kind = cfg.get("dec_kind", "convt")
+        enc = SpatialEncoder(in_channels=3, dim=dim, lat_size=lat_size,
+                             base_ch=enc_base, refine_blocks=enc_refine)
+        if dec_kind == "pixshuf":
+            dec = SpatialPixShufDecoder(dim=dim, out_channels=out_channels, lat_size=lat_size,
+                                         base_ch=dec_base, refine_blocks=dec_refine)
+        else:
+            dec = SpatialDecoder(dim=dim, out_channels=out_channels, lat_size=lat_size,
+                                 base_ch=dec_base, refine_blocks=dec_refine)
+    enc.load_state_dict(blob["encoder_state"]); enc.eval()
+    dec.load_state_dict(blob["decoder_state"]); dec.eval()
+
+    pb = cfg.get("pred_blocks", 2)
+    phid = cfg.get("pred_hidden", 64)
+    rn = cfg.get("run_name", "")
+    if "deep-stoch" in rn: pb, phid = 6, 128
+    elif "attn-deep" in rn: pb, phid = 4, 128
+
+    if pred_kind == "stoch-conv":
+        pred = StochasticConvPredictor(dim=dim, hidden=phid, n_blocks=pb)
+    elif pred_kind == "global-conv":
+        pred = GlobalConvPredictor(dim=dim, hidden=phid, n_blocks=pb, stochastic=False)
+    elif pred_kind == "global-stoch-conv":
+        pred = GlobalConvPredictor(dim=dim, hidden=phid, n_blocks=pb, stochastic=True)
+    elif pred_kind == "attn":
+        pred = AttnPredictor(dim=dim, hidden=phid, n_blocks=pb, stochastic=False)
+    elif pred_kind == "attn-stoch":
+        pred = AttnPredictor(dim=dim, hidden=phid, n_blocks=pb, stochastic=True)
+    else:
+        pred = make_predictor(pred_kind, dim=dim)
+    pred.load_state_dict(blob["predictor_state"]); pred.eval()
+    act_embed = nn.Embedding(4, dim)
+    act_embed.load_state_dict(blob["action_embed_state"]); act_embed.eval()
+
+    vq_K = cfg.get("vq_K", 0)
+    fsq_levels = cfg.get("fsq_levels", 0)
+    vq = None
+    if fsq_levels > 0:
+        vq = SpatialFSQ(dim=dim, levels=fsq_levels)
+        if "vq_state" in blob:
+            vq.load_state_dict(blob["vq_state"])
+        vq.eval(); vq = vq.to(device)
+    elif vq_K > 0 and "vq_state" in blob:
+        vq = SpatialVQ(dim=dim, K=vq_K)
+        vq.load_state_dict(blob["vq_state"]); vq.eval()
+        vq = vq.to(device)
+
+    enc = enc.to(device); dec = dec.to(device); pred = pred.to(device); act_embed = act_embed.to(device)
+    return dict(enc=enc, dec=dec, pred=pred, act_embed=act_embed, vq=vq, palette=palette,
+                K=K, dim=dim, cfg=cfg, ep=blob.get("epoch", "?"))
+
+
+def _viz_latent_rgb(z, out_size=64):
+    """Visualize a spatial latent z (B, C, H, W) or (B, dim) as an RGB image.
+    Takes first 3 channels, normalizes, upsamples to out_size."""
+    import torch.nn.functional as F
+    if z.dim() == 2:
+        # flat latent: just show as horizontal stripe
+        v = z[0]
+        v = (v - v.min()) / (v.max() - v.min() + 1e-6)
+        img = v.unsqueeze(0).expand(3, -1).unsqueeze(-1).expand(-1, -1, 4)
+        img = F.interpolate(img.unsqueeze(0), size=(out_size, out_size), mode="nearest")[0]
+        return img.clamp(0, 1)
+    # spatial: take first 3 channels
+    v = z[0, :3]                                                        # (3, H, W)
+    v_min = v.amin(dim=(-2, -1), keepdim=True)
+    v_max = v.amax(dim=(-2, -1), keepdim=True)
+    v = (v - v_min) / (v_max - v_min + 1e-6)
+    if v.size(-1) != out_size or v.size(-2) != out_size:
+        v = F.interpolate(v.unsqueeze(0), size=(out_size, out_size), mode="nearest")[0]
+    return v.clamp(0, 1)
+
+
+def run_combo_play(args):
+    """Open ONE window with GT | ENC | DEC | JEPA per run, stacked vertically.
+    Each row is a separate run with its own grid_cells / model.
+    Single keyboard input drives all envs simultaneously.
+    """
+    import pygame
+    from snake import Snake
+    from model import render_oracle_output
+
+    run_names = [r.strip() for r in args.runs.split(",") if r.strip()]
+    name = f"epoch_{args.epoch:03d}.pt" if args.epoch else "latest.pt"
+
+    rows = []
+    for rn in run_names:
+        ckpt = pull_checkpoint(name, run=rn)
+        if not ckpt.exists():
+            print(f"[combo] {rn}: checkpoint not found, skipping")
+            continue
+        blob = torch.load(ckpt, map_location="cpu", weights_only=False)
+        if blob.get("cfg", {}).get("mode") != "arch_jepa":
+            print(f"[combo] {rn}: not an arch_jepa run, skipping")
+            continue
+        m = _build_arch_jepa_model(blob, args.device)
+        gc = m["cfg"].get("grid_cells", 64)
+        env = Snake(seed=int(time.time()) & 0xFFFF, grid_cells=gc)
+        # Seed JEPA latent
+        seed_frame = env.render()
+        f0 = torch.from_numpy(seed_frame).float().permute(2, 0, 1).unsqueeze(0).to(args.device) / 255.0
+        with torch.no_grad():
+            z0 = m["enc"](f0)
+        rows.append(dict(run=rn, model=m, env=env, z=z0, grid_cells=gc))
+
+    if not rows:
+        print("[combo] no valid runs")
+        return
+
+    pygame.init()
+    cell = 64 * args.scale
+    n_panes = 4  # GT, ENC, DEC, JEPA
+    n_rows = len(rows)
+    pad_x, pad_y = 8, 28
+    W = cell * n_panes + pad_x * (n_panes - 1)
+    H = (cell + pad_y) * n_rows + 24
+    screen = pygame.display.set_mode((W, H))
+    pygame.display.set_caption(f"LeWM-Snake combo: {len(rows)} runs × 4 panes")
+    font = pygame.font.SysFont("monospace", 14)
+    small_font = pygame.font.SysFont("monospace", 11)
+    clock = pygame.time.Clock()
+
+    KEY_TO_ACTION = {
+        pygame.K_UP: 0, pygame.K_w: 0, pygame.K_DOWN: 1, pygame.K_s: 1,
+        pygame.K_LEFT: 2, pygame.K_a: 2, pygame.K_RIGHT: 3, pygame.K_d: 3,
+    }
+    NAMES = {0: "UP", 1: "DOWN", 2: "LEFT", 3: "RIGHT"}
+    rng = np.random.default_rng(int(time.time()) & 0xFFFF)
+    current_action = 3
+    step_idx = 0
+    running = True
+    while running:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key in (pygame.K_q, pygame.K_ESCAPE):
+                    running = False
+                elif event.key == pygame.K_n:
+                    s = int(rng.integers(1 << 30))
+                    for r in rows:
+                        r["env"] = Snake(seed=s, grid_cells=r["grid_cells"])
+                        f0 = torch.from_numpy(r["env"].render()).float().permute(2, 0, 1).unsqueeze(0).to(args.device) / 255.0
+                        with torch.no_grad():
+                            r["z"] = r["model"]["enc"](f0)
+                    step_idx = 0
+                elif event.key in KEY_TO_ACTION:
+                    current_action = KEY_TO_ACTION[event.key]
+
+        screen.fill((0, 0, 0))
+        for ri, r in enumerate(rows):
+            y0 = ri * (cell + pad_y)
+            env = r["env"]
+            m = r["model"]
+            _, done = env.step(current_action)
+            if done:
+                env = Snake(seed=int(rng.integers(1 << 30)), grid_cells=r["grid_cells"])
+                r["env"] = env
+                f0 = torch.from_numpy(env.render()).float().permute(2, 0, 1).unsqueeze(0).to(args.device) / 255.0
+                with torch.no_grad():
+                    r["z"] = m["enc"](f0)
+                continue
+            real_frame = env.render()
+            real_t = torch.from_numpy(real_frame).float().permute(2, 0, 1).unsqueeze(0).to(args.device) / 255.0
+            with torch.no_grad():
+                z_enc = m["enc"](real_t)
+                if m["vq"] is not None:
+                    z_enc_q, _ = m["vq"](z_enc)
+                else:
+                    z_enc_q = z_enc
+                raw_dec = m["dec"](z_enc_q)
+                recon_dec = render_oracle_output(raw_dec, "cat-kmeans-unique",
+                                                  K=m["K"], palette=m["palette"]).clamp(0, 1)[0]
+                a_t = m["act_embed"](torch.tensor([current_action], device=args.device))
+                z_new = m["pred"](r["z"], a_t)
+                if m["vq"] is not None:
+                    z_new, _ = m["vq"](z_new)
+                r["z"] = z_new
+                raw_jepa = m["dec"](z_new)
+                recon_jepa = render_oracle_output(raw_jepa, "cat-kmeans-unique",
+                                                   K=m["K"], palette=m["palette"]).clamp(0, 1)[0]
+                enc_viz = _viz_latent_rgb(z_enc, out_size=64)
+
+            def blit_pane(frame_chw_or_hwc, col):
+                if isinstance(frame_chw_or_hwc, np.ndarray):
+                    arr = frame_chw_or_hwc
+                else:
+                    arr = (frame_chw_or_hwc.cpu().numpy().transpose(1, 2, 0) * 255).clip(0, 255).round().astype(np.uint8)
+                surf = pygame.surfarray.make_surface(arr.swapaxes(0, 1))
+                surf = pygame.transform.scale(surf, (cell, cell))
+                screen.blit(surf, (col * (cell + pad_x), y0))
+
+            blit_pane(real_frame, 0)
+            blit_pane(enc_viz, 1)
+            blit_pane(recon_dec, 2)
+            blit_pane(recon_jepa, 3)
+            # row label
+            label = f"{r['run']}  grid={r['grid_cells']}  ep={m['ep']}"
+            screen.blit(small_font.render(label, True, (200, 200, 200)), (4, y0 + cell + 2))
+            for col, name_ in enumerate(["GT", "ENC", "DEC(AE)", "JEPA"]):
+                screen.blit(small_font.render(name_, True, (140, 140, 140)),
+                            (col * (cell + pad_x) + cell // 2 - 18, y0 + cell + 14))
+        # bottom: action
+        info = font.render(f"step={step_idx}  action={NAMES[current_action]}  (n=new game, q=quit)", True, (200, 200, 200))
+        screen.blit(info, (8, H - 20))
+        pygame.display.flip()
+        clock.tick(args.fps)
+        step_idx += 1
+    pygame.quit()
+
+
 def seed_from_real(history):
     """Seed the imagined game with `history` real Snake frames produced by
     repeatedly going right. Returns (pixels, actions) where actions[i] is the
@@ -844,11 +1082,17 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--epoch", type=int, default=None)
     ap.add_argument("--no-pull", action="store_true")
-    ap.add_argument("--scale", type=int, default=8, help="display upscaling factor")
+    ap.add_argument("--scale", type=int, default=4, help="display upscaling factor")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--fps", type=int, default=8)
     ap.add_argument("--run", default=None, help="experiment subdir under volume root")
+    ap.add_argument("--runs", default=None,
+                    help="comma-separated run names — opens combo window with GT|ENC|DEC|JEPA per run")
     args = ap.parse_args()
+
+    if args.runs:
+        run_combo_play(args)
+        return
 
     name = f"epoch_{args.epoch:03d}.pt" if args.epoch else "latest.pt"
     if args.no_pull:

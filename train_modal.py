@@ -408,10 +408,10 @@ def train_arch_jepa(
     # Initialized to large value so unseen windows are always sampled at least once.
     priorities = torch.ones(len(windows), dtype=torch.float64) * 10.0
     sample_batch = batch * 2 if hard_mining == "topk2x" else batch
+    steps_per_epoch = len(windows) // sample_batch
     if hard_mining == "prio":
-        from torch.utils.data import WeightedRandomSampler
         # WeightedRandomSampler is rebuilt each epoch with current priorities
-        loader = None  # built per epoch
+        loader = None
     else:
         loader = DataLoader(
             WMSet(), batch_size=sample_batch, shuffle=True, num_workers=4,
@@ -449,10 +449,10 @@ def train_arch_jepa(
     params = (list(enc.parameters()) + list(pred.parameters())
               + list(dec.parameters()) + list(action_embed.parameters()))
     n_params = sum(p.numel() for p in params)
-    print(f"[{run_name}] params: {n_params/1e6:.2f}M  pred={pred_kind}  steps/epoch: {len(loader)}", flush=True)
+    print(f"[{run_name}] params: {n_params/1e6:.2f}M  pred={pred_kind}  steps/epoch: {steps_per_epoch}", flush=True)
 
     opt = torch.optim.AdamW(params, lr=lr, weight_decay=1e-3)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs * len(loader))
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs * steps_per_epoch)
 
     run_dir = Path(CKPT_DIR, run_name)
     run_dir.mkdir(parents=True, exist_ok=True)

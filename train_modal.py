@@ -329,28 +329,37 @@ def train_predictor(
     volumes={CKPT_DIR: vol},
     timeout=60 * 60,
 )
-def train_arch_ae(
+def train_arch_jepa(
     run_name: str,
-    arch_kind: str,             # "flat", "spatial-16", "spatial-8", "unet-tiny", "unet-base"
+    arch_kind: str,             # "flat", "spatial-16", "spatial-8", "spatial-4"
     loss_kind: str = "cat-kmeans-perclass",
     epochs: int = 30,
-    batch: int = 256,
+    batch: int = 128,
     lr: float = 5e-4,
     num_episodes: int = 1500,
+    history: int = 4,
+    pred_horizon: int = 4,
     dim: int = 16,
     seed: int = 0,
+    pred_lambda: float = 1.0,
+    dec_lambda: float = 1.0,
+    rollout_dec: bool = True,   # if True, decoder loss is on PREDICTED latents (option B);
+                                 # if False, on encoded latents (option A — manifold-locked)
 ):
-    """Pure pixel-AE training, no predictor, no sigreg. Tests architectural
-    expressiveness for snake/food rendering."""
+    """Full JEPA system with spatial latent: encoder + ConvPredictor + decoder.
+    Trains on T-step windows with both pred MSE in latent space and dec CE in pixel space.
+    """
     import json
     import numpy as np
     import torch
     import torch.nn as nn
+    import torch.nn.functional as F
     from torch.utils.data import Dataset, DataLoader
 
     from snake import generate_dataset
     from model import (
-        OracleEncoderCNN, TinyDecoder, UNetAE, SpatialEncoder, SpatialDecoder,
+        OracleEncoderCNN, TinyDecoder, SpatialEncoder, SpatialDecoder,
+        MLPPredictor, ConvPredictor,
         kmeans_palette_unique, oracle_decoder_loss, oracle_decoder_out_channels,
     )
 
@@ -361,67 +370,64 @@ def train_arch_ae(
 
     K_PALETTE = 8
     out_channels = oracle_decoder_out_channels("cat-kmeans-unique", K=K_PALETTE)
-    print(f"[{run_name}] arch={arch_kind} loss={loss_kind} dim={dim} epochs={epochs}", flush=True)
+    print(f"[{run_name}] JEPA arch={arch_kind} loss={loss_kind} dim={dim} epochs={epochs} rollout_dec={rollout_dec}", flush=True)
 
     print(f"[{run_name}] generating {num_episodes} episodes ...", flush=True)
     t0 = time.time()
-    frames_list, _ = generate_dataset(num_episodes, seed=seed)
+    frames_list, actions_list = generate_dataset(num_episodes, seed=seed)
     print(f"[{run_name}] dataset built in {time.time()-t0:.1f}s", flush=True)
 
-    all_frames = np.concatenate(frames_list, axis=0)                                 # (N, 64, 64, 3)
-    print(f"[{run_name}] N frames: {all_frames.shape[0]}", flush=True)
+    # T-step windows
+    T = history + pred_horizon
+    windows = []
+    for f, a in zip(frames_list, actions_list):
+        if len(f) < T:
+            continue
+        for i in range(len(f) - T + 1):
+            windows.append((f[i:i + T], a[i:i + T - 1]))
+    print(f"[{run_name}] training windows: {len(windows)}  T={T}", flush=True)
 
-    sample_pix = torch.from_numpy(all_frames[:5000]).float() / 255.0
+    sample_pix = torch.from_numpy(np.stack([f for fr in frames_list[:200] for f in fr])).float() / 255.0
     palette = kmeans_palette_unique(sample_pix.to(device).reshape(-1, 3), K=K_PALETTE).cpu()
     palette_t = palette.to(device)
     print(f"[{run_name}] palette: {palette.tolist()}", flush=True)
 
-    class FrameSet(Dataset):
-        def __len__(self): return all_frames.shape[0]
+    class WMSet(Dataset):
+        def __len__(self): return len(windows)
         def __getitem__(self, i):
-            return torch.from_numpy(all_frames[i]).float().permute(2, 0, 1) / 255.0
+            f, a = windows[i]
+            return torch.from_numpy(f).float().permute(0, 3, 1, 2) / 255.0, torch.from_numpy(a).long()
 
     loader = DataLoader(
-        FrameSet(), batch_size=batch, shuffle=True, num_workers=4,
+        WMSet(), batch_size=batch, shuffle=True, num_workers=4,
         drop_last=True, pin_memory=True, persistent_workers=True,
     )
 
+    # Build architecture
+    is_spatial = arch_kind.startswith("spatial")
+    pred_kind = "conv" if is_spatial else "mlp"
     if arch_kind == "flat":
         enc = OracleEncoderCNN(in_channels=3, out_dim=dim).to(device)
         dec = TinyDecoder(dim=dim, ch=128, out_channels=out_channels).to(device)
-        is_unet = False
-        is_spatial = False
     elif arch_kind == "spatial-16":
         enc = SpatialEncoder(in_channels=3, dim=dim, lat_size=16).to(device)
         dec = SpatialDecoder(dim=dim, out_channels=out_channels, lat_size=16).to(device)
-        is_unet = False
-        is_spatial = True
     elif arch_kind == "spatial-8":
         enc = SpatialEncoder(in_channels=3, dim=dim, lat_size=8).to(device)
         dec = SpatialDecoder(dim=dim, out_channels=out_channels, lat_size=8).to(device)
-        is_unet = False
-        is_spatial = True
-    elif arch_kind == "unet-tiny":
-        unet = UNetAE(in_channels=3, out_channels=out_channels, base_ch=16).to(device)
-        is_unet = True
-        is_spatial = False
-        enc = unet
-        dec = unet
-    elif arch_kind == "unet-base":
-        unet = UNetAE(in_channels=3, out_channels=out_channels, base_ch=32).to(device)
-        is_unet = True
-        is_spatial = False
-        enc = unet
-        dec = unet
+    elif arch_kind == "spatial-4":
+        enc = SpatialEncoder(in_channels=3, dim=dim, lat_size=4).to(device)
+        dec = SpatialDecoder(dim=dim, out_channels=out_channels, lat_size=4).to(device)
     else:
         raise ValueError(arch_kind)
 
-    if is_unet:
-        params = list(enc.parameters())
-    else:
-        params = list(enc.parameters()) + list(dec.parameters())
+    pred = make_predictor(pred_kind, dim=dim).to(device)
+    action_embed = nn.Embedding(4, dim).to(device)
+
+    params = (list(enc.parameters()) + list(pred.parameters())
+              + list(dec.parameters()) + list(action_embed.parameters()))
     n_params = sum(p.numel() for p in params)
-    print(f"[{run_name}] params: {n_params/1e6:.2f}M  steps/epoch: {len(loader)}", flush=True)
+    print(f"[{run_name}] params: {n_params/1e6:.2f}M  pred={pred_kind}  steps/epoch: {len(loader)}", flush=True)
 
     opt = torch.optim.AdamW(params, lr=lr, weight_decay=1e-3)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs * len(loader))
@@ -429,59 +435,98 @@ def train_arch_ae(
     run_dir = Path(CKPT_DIR, run_name)
     run_dir.mkdir(parents=True, exist_ok=True)
     cfg = dict(
-        run_name=run_name, mode="arch_ae", arch_kind=arch_kind,
-        loss_kind=loss_kind, dim=dim, K=K_PALETTE, out_channels=out_channels,
+        run_name=run_name, mode="arch_jepa", arch_kind=arch_kind,
+        loss_kind=loss_kind, predictor_kind=pred_kind, dim=dim,
+        K=K_PALETTE, out_channels=out_channels,
         epochs=epochs, batch=batch, num_episodes=num_episodes,
+        history=history, pred_horizon=pred_horizon,
+        rollout_dec=rollout_dec, is_spatial=is_spatial,
     )
     (run_dir / "config.json").write_text(json.dumps(cfg, indent=2))
 
     train_t0 = time.time()
     for epoch in range(epochs):
-        enc.train()
-        if not is_unet:
-            dec.train()
-        total = 0.0; n = 0
+        enc.train(); pred.train(); dec.train(); action_embed.train()
+        total = {"loss": 0.0, "pred": 0.0, "dec": 0.0}; n = 0
         ep_t0 = time.time()
-        for f in loader:
-            f = f.to(device, non_blocking=True)
+        for f, a in loader:
+            f = f.to(device, non_blocking=True)             # (B, T, 3, 64, 64)
+            a = a.to(device, non_blocking=True)             # (B, T-1)
+            B, T_, C, H, W = f.shape
             with torch.amp.autocast(**autocast_kw):
-                if is_unet:
-                    raw = enc(f)
+                # Encode all frames
+                emb = enc(f.reshape(B * T_, C, H, W))
+                if is_spatial:
+                    emb = emb.view(B, T_, dim, emb.size(-2), emb.size(-1))
                 else:
-                    z = enc(f)
-                    raw = dec(z)
-                loss = oracle_decoder_loss(raw, f, loss_kind, K=K_PALETTE, palette=palette_t)
+                    emb = emb.view(B, T_, dim)
+                act_emb = action_embed(a)                    # (B, T-1, dim)
+
+                # Rollout: z_hat[0] = emb[0], then predictor
+                z_hat = [emb[:, 0]]
+                for t in range(T_ - 1):
+                    if is_spatial:
+                        z_next = pred(z_hat[-1], act_emb[:, t])
+                    else:
+                        z_next = pred(z_hat[-1], act_emb[:, t])
+                    z_hat.append(z_next)
+                z_hat_stack = torch.stack(z_hat, dim=1)      # (B, T, dim, [H_lat, W_lat])
+
+                # Pred loss: rollout matches encoded targets (teacher signal)
+                pred_loss = (z_hat_stack[:, 1:] - emb[:, 1:].detach()).pow(2).mean()
+
+                # Dec loss: render and compare to GT pixels
+                z_for_dec = z_hat_stack if rollout_dec else emb
+                if is_spatial:
+                    raw = dec(z_for_dec.reshape(B * T_, dim, z_for_dec.size(-2), z_for_dec.size(-1)))
+                else:
+                    raw = dec(z_for_dec.reshape(B * T_, dim))
+                pix_target = f.reshape(B * T_, C, H, W)
+                dec_loss = oracle_decoder_loss(
+                    raw, pix_target, loss_kind, K=K_PALETTE, palette=palette_t,
+                )
+
+                loss = pred_lambda * pred_loss + dec_lambda * dec_loss
+
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(params, 1.0)
             opt.step(); sched.step()
-            total += loss.item(); n += 1
+            total["loss"] += loss.item()
+            total["pred"] += pred_loss.item()
+            total["dec"] += dec_loss.item()
+            n += 1
 
         payload = {
-            "epoch": epoch + 1, "stage": "arch_ae",
-            "encoder_state": enc.state_dict() if not is_unet else None,
-            "decoder_state": dec.state_dict() if not is_unet else None,
-            "unet_state": enc.state_dict() if is_unet else None,
+            "epoch": epoch + 1, "stage": "arch_jepa",
+            "encoder_state": enc.state_dict(),
+            "decoder_state": dec.state_dict(),
+            "predictor_state": pred.state_dict(),
+            "action_embed_state": action_embed.state_dict(),
             "palette": palette,
             "cfg": cfg,
-            "loss": total / max(n, 1),
+            **{k: total[k] / max(n, 1) for k in total},
         }
         torch.save(payload, run_dir / f"epoch_{epoch+1:03d}.pt")
         torch.save(payload, run_dir / "latest.pt")
         vol.commit()
-        print(f"[{run_name}] ep {epoch+1}/{epochs} loss={total/n:.4f} ({time.time()-ep_t0:.1f}s)", flush=True)
+        print(f"[{run_name}] ep {epoch+1}/{epochs} "
+              f"loss={total['loss']/n:.4f} pred={total['pred']/n:.4f} "
+              f"dec={total['dec']/n:.4f} ({time.time()-ep_t0:.1f}s)", flush=True)
 
     print(f"[{run_name}] DONE in {time.time()-train_t0:.0f}s", flush=True)
 
 
-# Architecture ablation: same loss (per-class CE), vary architecture. All pure AE.
+# JEPA architecture ablation: full system (encoder + predictor + decoder).
+# Spatial latents preserve positional info so predictor + decoder can render snake/food
+# at exact pixel positions during imagined rollout.
 ARCH_RUNS = [
     # (run_name,           arch_kind)
-    ("arch-flat-control",  "flat"),         # control: existing flat 16-d global latent
-    ("arch-spatial-16",    "spatial-16"),   # 16-channel spatial latent at 16x16
-    ("arch-spatial-8",     "spatial-8"),    # 16-channel spatial latent at 8x8
-    ("arch-unet-tiny",     "unet-tiny"),    # U-Net with skip connections, base_ch=16
-    ("arch-unet-base",     "unet-base"),    # U-Net base_ch=32
+    ("jepa-flat-control",  "flat"),         # flat 16-d + MLP predictor (broken control)
+    ("jepa-spatial-16",    "spatial-16"),   # (16, 16, 16) latent + ConvPredictor
+    ("jepa-spatial-8",     "spatial-8"),    # (16, 8, 8) + ConvPredictor
+    ("jepa-spatial-4",     "spatial-4"),    # (16, 4, 4) + ConvPredictor
+    ("jepa-spatial-16-tf", "spatial-16"),   # spatial-16 with rollout_dec=False (manifold-locked dec)
 ]
 
 
@@ -1329,10 +1374,13 @@ def train_manifold(
 
 @app.local_entrypoint()
 def main():
-    print(f"Spawning {len(ARCH_RUNS)} parallel A10G jobs (architecture ablation, pure AE) ...")
+    print(f"Spawning {len(ARCH_RUNS)} parallel A10G jobs (JEPA architecture ablation) ...")
     for run_name, arch_kind in ARCH_RUNS:
-        h = train_arch_ae.spawn(run_name=run_name, arch_kind=arch_kind)
-        print(f"  spawned {run_name} ({arch_kind}): {h.object_id}")
+        rollout_dec = (run_name != "jepa-spatial-16-tf")  # only -tf uses teacher-forced dec
+        h = train_arch_jepa.spawn(
+            run_name=run_name, arch_kind=arch_kind, rollout_dec=rollout_dec,
+        )
+        print(f"  spawned {run_name} ({arch_kind}, rollout_dec={rollout_dec}): {h.object_id}")
     print("All jobs spawned.")
     return
     # legacy entrypoint below

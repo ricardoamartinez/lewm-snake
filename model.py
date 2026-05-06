@@ -352,12 +352,40 @@ class TransformerPredictor(nn.Module):
         return self.forward(z_hist, a_hist)[:, -1]
 
 
+class ConvPredictor(nn.Module):
+    """JEPA conv predictor on spatial latent.
+    Input z: (B, dim, H, W). Output z_next: (B, dim, H, W). Action conditioned.
+    """
+    def __init__(self, dim: int = 16, hidden: int = 64, n_blocks: int = 2):
+        super().__init__()
+        self.dim = dim
+        self.in_proj = nn.Conv2d(dim, hidden, 3, 1, 1)
+        self.blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.GroupNorm(min(8, hidden), hidden), nn.GELU(),
+                nn.Conv2d(hidden, hidden, 3, 1, 1),
+                nn.GroupNorm(min(8, hidden), hidden), nn.GELU(),
+                nn.Conv2d(hidden, hidden, 3, 1, 1),
+            ) for _ in range(n_blocks)
+        ])
+        self.out_proj = nn.Conv2d(hidden, dim, 3, 1, 1)
+
+    def forward(self, z, action_emb):
+        # z: (B, dim, H, W), action_emb: (B, dim)  — broadcast across spatial
+        a = action_emb.unsqueeze(-1).unsqueeze(-1)
+        h = self.in_proj(z + a)
+        for blk in self.blocks:
+            h = h + blk(h)
+        return z + self.out_proj(h)
+
+
 def make_predictor(kind: str, dim: int = 16):
     if kind == "mlp":         return MLPPredictor(dim=dim, residual=False)
     if kind == "residual":    return MLPPredictor(dim=dim, residual=True)
     if kind == "multistep":   return MLPPredictor(dim=dim, residual=False)
     if kind == "transformer": return TransformerPredictor(dim=dim)
     if kind == "rnn":         return GRUPredictor(dim=dim, hidden=64)
+    if kind == "conv":        return ConvPredictor(dim=dim, hidden=64, n_blocks=2)
     raise ValueError(kind)
 
 

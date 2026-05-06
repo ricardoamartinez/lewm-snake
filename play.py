@@ -137,6 +137,138 @@ def render_oracle_output(raw, loss_kind, K=None, palette=None):
     return model_render_oracle(raw, loss_kind, K=K, palette=palette)
 
 
+def run_arch_jepa_play(args, ckpt_path):
+    """JEPA rollout: encode SEED frame once, then predictor evolves latent under
+    user keypresses. Decoder renders each rolled latent. Real frames never touch
+    the encoder after t=0.
+    Left = real Snake env, right = imagined rollout."""
+    import pygame
+    import torch.nn as nn
+    from snake import Snake
+    from model import (
+        OracleEncoderCNN, TinyDecoder, SpatialEncoder, SpatialDecoder,
+        make_predictor, render_oracle_output,
+    )
+
+    blob = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    cfg = blob["cfg"]
+    arch = cfg["arch_kind"]; dim = cfg["dim"]; K = cfg["K"]
+    out_channels = cfg["out_channels"]
+    is_spatial = cfg["is_spatial"]
+    pred_kind = cfg["predictor_kind"]
+    palette = blob["palette"]
+    if not isinstance(palette, torch.Tensor): palette = torch.tensor(palette)
+
+    if arch == "flat":
+        enc = OracleEncoderCNN(in_channels=3, out_dim=dim)
+        dec = TinyDecoder(dim=dim, ch=128, out_channels=out_channels)
+    elif arch == "spatial-16":
+        enc = SpatialEncoder(in_channels=3, dim=dim, lat_size=16)
+        dec = SpatialDecoder(dim=dim, out_channels=out_channels, lat_size=16)
+    elif arch == "spatial-8":
+        enc = SpatialEncoder(in_channels=3, dim=dim, lat_size=8)
+        dec = SpatialDecoder(dim=dim, out_channels=out_channels, lat_size=8)
+    elif arch == "spatial-4":
+        enc = SpatialEncoder(in_channels=3, dim=dim, lat_size=4)
+        dec = SpatialDecoder(dim=dim, out_channels=out_channels, lat_size=4)
+    else:
+        raise ValueError(arch)
+    enc.load_state_dict(blob["encoder_state"]); enc.eval()
+    dec.load_state_dict(blob["decoder_state"]); dec.eval()
+    pred = make_predictor(pred_kind, dim=dim)
+    pred.load_state_dict(blob["predictor_state"]); pred.eval()
+    act_embed = nn.Embedding(4, dim)
+    act_embed.load_state_dict(blob["action_embed_state"]); act_embed.eval()
+
+    enc = enc.to(args.device); dec = dec.to(args.device)
+    pred = pred.to(args.device); act_embed = act_embed.to(args.device)
+    ep = blob.get("epoch", "?")
+
+    pygame.init()
+    cell = 64 * args.scale
+    screen = pygame.display.set_mode((cell * 2 + 8, cell + 40))
+    title = f"LeWM-Snake JEPA [{args.run}] ep={ep} arch={arch}"
+    pygame.display.set_caption(title)
+    font = pygame.font.SysFont("monospace", 14)
+    clock = pygame.time.Clock()
+
+    KEY_TO_ACTION = {
+        pygame.K_UP: 0, pygame.K_w: 0, pygame.K_DOWN: 1, pygame.K_s: 1,
+        pygame.K_LEFT: 2, pygame.K_a: 2, pygame.K_RIGHT: 3, pygame.K_d: 3,
+    }
+    NAMES = {0: "UP", 1: "DOWN", 2: "LEFT", 3: "RIGHT"}
+
+    rng = np.random.default_rng(int(time.time()) & 0xFFFF)
+    env = Snake(seed=int(rng.integers(1 << 30)))
+
+    def reset_imag():
+        with torch.no_grad():
+            seed_frame = env.render()
+            f = torch.from_numpy(seed_frame).float().permute(2, 0, 1).unsqueeze(0).to(args.device) / 255.0
+            z0 = enc(f)
+        return z0
+
+    z = reset_imag()
+    current_action = 3
+    step_idx = 0
+    running = True
+    while running:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key in (pygame.K_q, pygame.K_ESCAPE):
+                    running = False
+                elif event.key == pygame.K_r:
+                    new_ckpt = pull_checkpoint("latest.pt", run=args.run)
+                    if new_ckpt.exists():
+                        blob2 = torch.load(new_ckpt, map_location="cpu", weights_only=False)
+                        enc.load_state_dict(blob2["encoder_state"])
+                        dec.load_state_dict(blob2["decoder_state"])
+                        pred.load_state_dict(blob2["predictor_state"])
+                        act_embed.load_state_dict(blob2["action_embed_state"])
+                        ep = blob2.get("epoch", "?")
+                        pygame.display.set_caption(f"LeWM-Snake JEPA [{args.run}] ep={ep} arch={arch}")
+                        env = Snake(seed=int(rng.integers(1 << 30)))
+                        z = reset_imag(); step_idx = 0
+                elif event.key == pygame.K_n:
+                    env = Snake(seed=int(rng.integers(1 << 30)))
+                    z = reset_imag(); step_idx = 0
+                elif event.key in KEY_TO_ACTION:
+                    current_action = KEY_TO_ACTION[event.key]
+
+        _, done = env.step(current_action)
+        if done:
+            env = Snake(seed=int(rng.integers(1 << 30)))
+            z = reset_imag(); step_idx = 0
+            continue
+        real_frame = env.render()
+
+        with torch.no_grad():
+            a_t = act_embed(torch.tensor([current_action], device=args.device))  # (1, dim)
+            z = pred(z, a_t)                                                       # roll latent
+            raw = dec(z)
+            recon = render_oracle_output(raw, "cat-kmeans-unique", K=K, palette=palette).clamp(0, 1)[0]
+
+        screen.fill((0, 0, 0))
+        real_surf = pygame.surfarray.make_surface(real_frame.swapaxes(0, 1))
+        real_surf = pygame.transform.scale(real_surf, (cell, cell))
+        screen.blit(real_surf, (0, 0))
+        rec_arr = (recon.cpu().numpy().transpose(1, 2, 0) * 255).clip(0, 255).round().astype(np.uint8)
+        rec_surf = pygame.surfarray.make_surface(rec_arr.swapaxes(0, 1))
+        rec_surf = pygame.transform.scale(rec_surf, (cell, cell))
+        screen.blit(rec_surf, (cell + 8, 0))
+        info = font.render(
+            f"ep={ep} arch={arch} step={step_idx} act={NAMES[current_action]} L=REAL R=IMAGINED(JEPA)",
+            True, (200, 200, 200),
+        )
+        screen.blit(info, (8, cell + 12))
+        pygame.display.flip()
+        clock.tick(args.fps)
+        step_idx += 1
+    pygame.quit()
+
+
 def run_arch_ae_play(args, ckpt_path):
     """Pure-AE replay: real frame -> encoder -> decoder -> reconstruction.
     Left = real Snake, right = AE reconstruction. No predictor.
@@ -674,6 +806,10 @@ def main():
     if mode == "full":
         print(f"[play] {args.run or '?'}: full-system (pixel encoder + predictor + decoder) mode")
         run_full_play(args, ckpt)
+        return
+    if mode == "arch_jepa":
+        print(f"[play] {args.run or '?'}: arch-JEPA mode (seed once, predictor rolls latent)")
+        run_arch_jepa_play(args, ckpt)
         return
     if mode == "arch_ae":
         print(f"[play] {args.run or '?'}: arch-AE mode (no predictor — encode/decode every real frame)")

@@ -506,6 +506,42 @@ class AttnPredictor(nn.Module):
         return z + self.out_proj(h)
 
 
+class VariationalConvPredictor(nn.Module):
+    """Variational JEPA conv predictor: outputs (μ, σ) per cell, samples z via
+    reparameterization. KL(N(μ,σ)||N(0,I)) regularizes noise channel.
+    Forces the model to use noise to commit to specific futures rather than output
+    the AVERAGE of plausible futures (multi-food artifact root cause).
+    """
+    def __init__(self, dim: int = 16, hidden: int = 64, n_blocks: int = 2):
+        super().__init__()
+        self.dim = dim
+        self.in_proj = nn.Conv2d(dim, hidden, 3, 1, 1)
+        self.blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.GroupNorm(min(8, hidden), hidden), nn.GELU(),
+                nn.Conv2d(hidden, hidden, 3, 1, 1),
+                nn.GroupNorm(min(8, hidden), hidden), nn.GELU(),
+                nn.Conv2d(hidden, hidden, 3, 1, 1),
+            ) for _ in range(n_blocks)
+        ])
+        self.mu_out = nn.Conv2d(hidden, dim, 3, 1, 1)
+        self.logsig_out = nn.Conv2d(hidden, dim, 3, 1, 1)
+
+    def forward(self, z, action_emb):
+        a = action_emb.unsqueeze(-1).unsqueeze(-1)
+        h = self.in_proj(z + a)
+        for blk in self.blocks:
+            h = h + blk(h)
+        mu = self.mu_out(h)
+        logsig = self.logsig_out(h).clamp(-5.0, 2.0)
+        sig = logsig.exp()
+        eps = torch.randn_like(mu)
+        z_next = z + mu + sig * eps                                          # residual + reparam
+        # KL(N(mu, sig^2) || N(0, 1)) per element, mean over cells/channels
+        kl = 0.5 * (mu.pow(2) + sig.pow(2) - 2.0 * logsig - 1.0).mean()
+        return z_next, kl
+
+
 class StochasticConvPredictor(nn.Module):
     """Stochastic JEPA conv predictor: samples a noise tensor each call so the
     network can output one concrete future rather than the AVERAGE over plausible

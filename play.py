@@ -148,6 +148,7 @@ def run_arch_jepa_play(args, ckpt_path):
     from model import (
         OracleEncoderCNN, TinyDecoder, SpatialEncoder, SpatialDecoder, SpatialPixShufDecoder,
         ConvPredictor, StochasticConvPredictor, GlobalConvPredictor, AttnPredictor,
+        VariationalConvPredictor,
         SpatialVQ, SpatialFSQ, make_predictor, render_oracle_output,
     )
 
@@ -201,6 +202,8 @@ def run_arch_jepa_play(args, ckpt_path):
         pred = AttnPredictor(dim=dim, hidden=phid, n_blocks=pb, stochastic=False)
     elif pred_kind == "attn-stoch":
         pred = AttnPredictor(dim=dim, hidden=phid, n_blocks=pb, stochastic=True)
+    elif pred_kind == "variational":
+        pred = VariationalConvPredictor(dim=dim, hidden=phid, n_blocks=pb)
     else:
         pred = make_predictor(pred_kind, dim=dim)
     pred.load_state_dict(blob["predictor_state"]); pred.eval()
@@ -300,7 +303,8 @@ def run_arch_jepa_play(args, ckpt_path):
 
             # JEPA: roll predictor forward — tests dynamics
             a_t = act_embed(torch.tensor([current_action], device=args.device))
-            z = pred(z, a_t)
+            pred_out = pred(z, a_t)
+            z = pred_out[0] if isinstance(pred_out, tuple) else pred_out
             if vq is not None:
                 z, _ = vq(z)
             raw_jepa = dec(z)
@@ -874,6 +878,8 @@ def _build_arch_jepa_model(blob, device):
         pred = AttnPredictor(dim=dim, hidden=phid, n_blocks=pb, stochastic=False)
     elif pred_kind == "attn-stoch":
         pred = AttnPredictor(dim=dim, hidden=phid, n_blocks=pb, stochastic=True)
+    elif pred_kind == "variational":
+        pred = VariationalConvPredictor(dim=dim, hidden=phid, n_blocks=pb)
     else:
         pred = make_predictor(pred_kind, dim=dim)
     pred.load_state_dict(blob["predictor_state"]); pred.eval()
@@ -1042,7 +1048,8 @@ def run_combo_play(args):
                 recon_dec = render_oracle_output(raw_dec, "cat-kmeans-unique",
                                                   K=m["K"], palette=m["palette"]).clamp(0, 1)[0]
                 a_t = m["act_embed"](torch.tensor([current_action], device=args.device))
-                z_new = m["pred"](r["z"], a_t)
+                pred_out = m["pred"](r["z"], a_t)
+                z_new = pred_out[0] if isinstance(pred_out, tuple) else pred_out
                 if m["vq"] is not None:
                     z_new, _ = m["vq"](z_new)
                 r["z"] = z_new

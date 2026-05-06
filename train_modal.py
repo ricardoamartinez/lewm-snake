@@ -357,6 +357,7 @@ def train_arch_jepa(
     vq_K: int = 0,                  # if > 0, apply VQ with K codes between predictor and decoder
     fsq_levels: int = 0,            # if > 0, apply FSQ with L levels per dim (more stable than VQ)
     grid_cells: int = 64,           # snake game grid (16 = chunky 4px cells, 64 = 1px cells)
+    kl_lambda: float = 0.0,         # variational KL weight (only used with variational predictor)
 ):
     """Full JEPA system with spatial latent: encoder + ConvPredictor + decoder.
     Trains on T-step windows with both pred MSE in latent space and dec CE in pixel space.
@@ -372,6 +373,7 @@ def train_arch_jepa(
     from model import (
         OracleEncoderCNN, TinyDecoder, SpatialEncoder, SpatialDecoder, SpatialPixShufDecoder,
         MLPPredictor, ConvPredictor, StochasticConvPredictor, GlobalConvPredictor, AttnPredictor,
+        VariationalConvPredictor,
         SpatialVQ, SpatialFSQ, make_predictor,
         kmeans_palette_unique, oracle_decoder_loss, oracle_decoder_out_channels,
     )
@@ -471,6 +473,8 @@ def train_arch_jepa(
         pred = AttnPredictor(dim=dim, hidden=pred_hidden, n_blocks=pred_blocks, stochastic=False).to(device)
     elif effective_pred_kind == "attn-stoch":
         pred = AttnPredictor(dim=dim, hidden=pred_hidden, n_blocks=pred_blocks, stochastic=True).to(device)
+    elif effective_pred_kind == "variational":
+        pred = VariationalConvPredictor(dim=dim, hidden=pred_hidden, n_blocks=pred_blocks).to(device)
     else:
         pred = make_predictor(effective_pred_kind, dim=dim).to(device)
     pred_kind = effective_pred_kind
@@ -525,8 +529,14 @@ def train_arch_jepa(
         act_emb = action_embed(a_w)
         z_hat = [emb[:, 0]]
         commit_loss_total = z_hat[0].new_zeros(())
+        kl_loss_total = z_hat[0].new_zeros(())
+        is_variational = effective_pred_kind == "variational"
         for t in range(T_ - 1):
-            z_next = pred(z_hat[-1], act_emb[:, t])
+            if is_variational:
+                z_next, kl_t = pred(z_hat[-1], act_emb[:, t])
+                kl_loss_total = kl_loss_total + kl_t
+            else:
+                z_next = pred(z_hat[-1], act_emb[:, t])
             if latent_noise > 0:
                 z_next = z_next + latent_noise * torch.randn_like(z_next)
             if vq is not None:
@@ -552,6 +562,8 @@ def train_arch_jepa(
             dec_loss_mean = dec_loss_mean + entropy_lambda * entropy_per_pixel.mean()
         if vq is not None:
             dec_loss_mean = dec_loss_mean + commit_loss_total / max(T_ - 1, 1)
+        if is_variational and kl_lambda > 0:
+            dec_loss_mean = dec_loss_mean + kl_lambda * (kl_loss_total / max(T_ - 1, 1))
         # Priority signal: per-window mean per-pixel CE (vectorized, no_grad)
         with torch.no_grad():
             p = palette_t.view(1, palette_t.size(0), 3, 1, 1).to(pix_target.dtype)
@@ -654,16 +666,16 @@ def train_arch_jepa(
 # stochastic predictor + entropy reg. Force commitment via discrete VQ codes:
 # predictor's continuous output is snapped to ONE of K codes per cell.
 # Different K and combos to find sweet spot.
-# 1:1 latent: spatial-64 → encoder produces a 64x64 latent (one vector per pixel).
-# No downsampling = no information lost = no blob possible structurally.
-# Play UI shows GT | ENC | DEC(AE) | JEPA per run.
+# Variational predictor: outputs (μ,σ) per cell, samples z via reparameterization,
+# KL regularizes noise channel. Forces predictor to commit to ONE concrete future
+# instead of averaging over plausible food respawn positions.
 ARCH_RUNS = [
-    # (run_name,            arch_kind,    dec_kind,  ent,  pred_override, pb, ph,  fsq_L, grid_cells)
-    ("p1-g64-control",      "spatial-64", "pixshuf", 0.3,  "stoch-conv",   2, 64,  0,     64),
-    ("p1-g64-fsq5",         "spatial-64", "pixshuf", 0.3,  "stoch-conv",   2, 64,  5,     64),
-    ("p1-g16-control",      "spatial-64", "pixshuf", 0.3,  "stoch-conv",   2, 64,  0,     16),
-    ("p1-g16-fsq5",         "spatial-64", "pixshuf", 0.3,  "stoch-conv",   2, 64,  5,     16),
-    ("p1-g16-fsq3",         "spatial-64", "pixshuf", 0.3,  "stoch-conv",   2, 64,  3,     16),
+    # (run_name,        grid, pred_override,  fsq_L, kl_lambda)
+    ("var-g64",         64,   "variational",  0,     0.01),
+    ("var-g64-kl001",   64,   "variational",  0,     0.001),
+    ("var-g16",         16,   "variational",  0,     0.01),
+    ("var-g16-fsq5",    16,   "variational",  5,     0.01),
+    ("var-g64-fsq5",    64,   "variational",  5,     0.01),
 ]
 
 
@@ -1511,26 +1523,23 @@ def train_manifold(
 
 @app.local_entrypoint()
 def main():
-    print(f"Spawning {len(ARCH_RUNS)} parallel H100 jobs (1:1 latent: spatial-64) ...")
-    for run_name, arch_kind, dec_kind, ent, pred_override, pb, phid, fsq_L, gc in ARCH_RUNS:
-        # spatial-64 is heavy: full-res rollout. Smaller batch + fewer steps + shorter rollout.
-        bs = 16 if arch_kind.startswith("spatial-64") else 64
-        ph = 24 if arch_kind.startswith("spatial-64") else 32
-        cap = 200 if arch_kind.startswith("spatial-64") else 500
+    print(f"Spawning {len(ARCH_RUNS)} parallel H100 jobs (variational predictor + spatial-64) ...")
+    for run_name, gc, pred_override, fsq_L, kl_l in ARCH_RUNS:
         h = train_arch_jepa.spawn(
-            run_name=run_name, arch_kind=arch_kind,
+            run_name=run_name, arch_kind="spatial-64",
             rollout_dec=True, pred_lambda=0.0,
-            history=1, pred_horizon=ph,
-            latent_noise=0.01, batch=bs,
+            history=1, pred_horizon=24,
+            latent_noise=0.01, batch=16,
             num_episodes=1500,
-            steps_per_epoch_cap=cap,
+            steps_per_epoch_cap=200,
             hard_mining="prio", prio_alpha=1.0,
-            dec_kind=dec_kind, entropy_lambda=ent,
+            dec_kind="pixshuf", entropy_lambda=0.3,
             predictor_kind_override=pred_override,
-            pred_blocks=pb, pred_hidden=phid,
+            pred_blocks=2, pred_hidden=64,
             fsq_levels=fsq_L, grid_cells=gc,
+            kl_lambda=kl_l,
         )
-        print(f"  spawned {run_name} (grid={gc}, arch={arch_kind}, fsq_L={fsq_L}, bs={bs}): {h.object_id}")
+        print(f"  spawned {run_name} (grid={gc}, pred={pred_override}, fsq_L={fsq_L}, kl={kl_l}): {h.object_id}")
     print("All jobs spawned.")
     return
     # legacy entrypoint below

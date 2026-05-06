@@ -153,8 +153,8 @@ def train_predictor(
 
     print(f"[{run_name}] dataset built in {time.time()-t0:.1f}s", flush=True)
 
-    # K-means palette on UNIQUE colors
-    sample_pix = torch.from_numpy(np.stack([f for fr in frames_list[:200] for f in fr])).float().permute(0, 3, 1, 2) / 255.0
+    # K-means palette on UNIQUE colors (keep channel-last before flatten — each row = one (R,G,B) triplet)
+    sample_pix = torch.from_numpy(np.stack([f for fr in frames_list[:200] for f in fr])).float() / 255.0  # (N, 64, 64, 3)
     palette = kmeans_palette_unique(sample_pix.to(device).reshape(-1, 3), K=K).cpu()
     print(f"[{run_name}] palette: {palette.tolist()}", flush=True)
 
@@ -684,8 +684,8 @@ def train_manifold(
     )
     print(f"[{run_name}] dataset built in {time.time()-t0:.1f}s", flush=True)
 
-    # K-means palette
-    sample_pix = torch.from_numpy(np.stack([f for fr in frames_list[:200] for f in fr])).float().permute(0, 3, 1, 2) / 255.0
+    # K-means palette: keep channel-last before flatten so each row is a real (R,G,B) triplet
+    sample_pix = torch.from_numpy(np.stack([f for fr in frames_list[:200] for f in fr])).float() / 255.0  # (N, 64, 64, 3)
     palette = kmeans_palette_unique(sample_pix.to(device).reshape(-1, 3), K=K_PALETTE).cpu()
     palette_t = palette.to(device)
 

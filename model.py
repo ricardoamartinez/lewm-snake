@@ -393,6 +393,123 @@ class OracleEncoderCNN(nn.Module):
         return self.net(state)
 
 
+class UNetAE(nn.Module):
+    """Standard U-Net autoencoder for pixel-precise reconstruction.
+
+    Skip connections at every scale let the decoder use high-frequency input
+    detail directly. Outputs `out_channels` logits per pixel.
+    """
+    def __init__(self, in_channels=3, out_channels=8, base_ch=32):
+        super().__init__()
+        c = base_ch
+
+        def block(c_in, c_out):
+            return nn.Sequential(
+                nn.Conv2d(c_in, c_out, 3, 1, 1), nn.GroupNorm(min(8, c_out), c_out), nn.GELU(),
+                nn.Conv2d(c_out, c_out, 3, 1, 1), nn.GroupNorm(min(8, c_out), c_out), nn.GELU(),
+            )
+
+        # Encoder
+        self.enc1 = block(in_channels, c)                         # 64x64
+        self.down1 = nn.Conv2d(c, c, 4, 2, 1)                     # -> 32
+        self.enc2 = block(c, c * 2)
+        self.down2 = nn.Conv2d(c * 2, c * 2, 4, 2, 1)             # -> 16
+        self.enc3 = block(c * 2, c * 4)
+        self.down3 = nn.Conv2d(c * 4, c * 4, 4, 2, 1)             # -> 8
+        self.bottom = block(c * 4, c * 4)
+        # Decoder
+        self.up3 = nn.ConvTranspose2d(c * 4, c * 4, 4, 2, 1)      # 8 -> 16
+        self.dec3 = block(c * 8, c * 4)                            # cat with enc3
+        self.up2 = nn.ConvTranspose2d(c * 4, c * 2, 4, 2, 1)      # 16 -> 32
+        self.dec2 = block(c * 4, c * 2)                            # cat with enc2
+        self.up1 = nn.ConvTranspose2d(c * 2, c, 4, 2, 1)          # 32 -> 64
+        self.dec1 = block(c * 2, c)                                # cat with enc1
+        self.head = nn.Conv2d(c, out_channels, 1)
+
+    def encode(self, x):
+        x1 = self.enc1(x)
+        x2 = self.enc2(self.down1(x1))
+        x3 = self.enc3(self.down2(x2))
+        b = self.bottom(self.down3(x3))
+        return x1, x2, x3, b
+
+    def decode(self, x1, x2, x3, b):
+        d3 = self.dec3(torch.cat([self.up3(b), x3], dim=1))
+        d2 = self.dec2(torch.cat([self.up2(d3), x2], dim=1))
+        d1 = self.dec1(torch.cat([self.up1(d2), x1], dim=1))
+        return self.head(d1)
+
+    def forward(self, x):
+        return self.decode(*self.encode(x))
+
+
+class SpatialEncoder(nn.Module):
+    """CNN that produces a spatial latent (B, dim, lat_H, lat_W) — no FC layer.
+
+    Each spatial cell of the latent corresponds to a local region of input pixels,
+    so positional information is preserved naturally.
+    """
+    def __init__(self, in_channels=3, dim=16, lat_size=16, base_ch=32):
+        super().__init__()
+        ladder = {64: 0, 32: 1, 16: 2, 8: 3, 4: 4}
+        n_down = ladder[lat_size]
+        layers = []
+        c_in = in_channels
+        c = base_ch
+        for i in range(n_down):
+            c_out = min(base_ch * (2 ** i), 256)
+            layers += [
+                nn.Conv2d(c_in, c_out, 4, 2, 1),
+                nn.GroupNorm(min(8, c_out), c_out), nn.GELU(),
+            ]
+            c_in = c_out
+            c = c_out
+        layers += [
+            nn.Conv2d(c, c, 3, 1, 1),
+            nn.GroupNorm(min(8, c), c), nn.GELU(),
+            nn.Conv2d(c, dim, 1),
+        ]
+        self.net = nn.Sequential(*layers)
+        self.lat_size = lat_size
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class SpatialDecoder(nn.Module):
+    """ConvT pyramid that takes a spatial latent (B, dim, lat_H, lat_W) directly.
+
+    Produces (B, out_channels, 64, 64). No FC layer — spatial info preserved.
+    """
+    def __init__(self, dim=16, out_channels=8, lat_size=16, base_ch=128):
+        super().__init__()
+        ladder = {64: 0, 32: 1, 16: 2, 8: 3, 4: 4}
+        n_up = ladder[lat_size]
+        layers = [
+            nn.Conv2d(dim, base_ch, 1),
+            nn.GroupNorm(8, base_ch), nn.SiLU(),
+        ]
+        c = base_ch
+        for i in range(n_up):
+            c_next = max(base_ch // (2 ** (i + 1)), 32)
+            is_last = (i == n_up - 1)
+            layers += [
+                nn.ConvTranspose2d(c, c_next, 4, 2, 1),
+                nn.GroupNorm(min(8, c_next), c_next), nn.SiLU(),
+            ]
+            c = c_next
+        layers += [
+            nn.Conv2d(c, c, 3, 1, 1),
+            nn.GroupNorm(min(8, c), c), nn.SiLU(),
+            nn.Conv2d(c, out_channels, 1),
+        ]
+        self.net = nn.Sequential(*layers)
+        self.lat_size = lat_size
+
+    def forward(self, z):
+        return self.net(z)
+
+
 def kmeans_palette_unique(pixels, K=8, n_iter=20, quant=255, seed=0):
     """K-means on UNIQUE pixel colors so each color contributes equally
     to clustering, regardless of class imbalance. Quantises RGB to `quant`

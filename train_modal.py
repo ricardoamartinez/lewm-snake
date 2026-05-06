@@ -323,6 +323,168 @@ def train_predictor(
     print(f"[{run_name}] DONE", flush=True)
 
 
+@app.function(
+    image=image,
+    gpu="A10G",
+    volumes={CKPT_DIR: vol},
+    timeout=60 * 60,
+)
+def train_arch_ae(
+    run_name: str,
+    arch_kind: str,             # "flat", "spatial-16", "spatial-8", "unet-tiny", "unet-base"
+    loss_kind: str = "cat-kmeans-perclass",
+    epochs: int = 30,
+    batch: int = 256,
+    lr: float = 5e-4,
+    num_episodes: int = 1500,
+    dim: int = 16,
+    seed: int = 0,
+):
+    """Pure pixel-AE training, no predictor, no sigreg. Tests architectural
+    expressiveness for snake/food rendering."""
+    import json
+    import numpy as np
+    import torch
+    import torch.nn as nn
+    from torch.utils.data import Dataset, DataLoader
+
+    from snake import generate_dataset
+    from model import (
+        OracleEncoderCNN, TinyDecoder, UNetAE, SpatialEncoder, SpatialDecoder,
+        kmeans_palette_unique, oracle_decoder_loss, oracle_decoder_out_channels,
+    )
+
+    torch.set_float32_matmul_precision("high")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    use_bf16 = device == "cuda"
+    autocast_kw = dict(device_type="cuda", dtype=torch.bfloat16) if use_bf16 else dict(device_type="cpu", enabled=False)
+
+    K_PALETTE = 8
+    out_channels = oracle_decoder_out_channels("cat-kmeans-unique", K=K_PALETTE)
+    print(f"[{run_name}] arch={arch_kind} loss={loss_kind} dim={dim} epochs={epochs}", flush=True)
+
+    print(f"[{run_name}] generating {num_episodes} episodes ...", flush=True)
+    t0 = time.time()
+    frames_list, _ = generate_dataset(num_episodes, seed=seed)
+    print(f"[{run_name}] dataset built in {time.time()-t0:.1f}s", flush=True)
+
+    all_frames = np.concatenate(frames_list, axis=0)                                 # (N, 64, 64, 3)
+    print(f"[{run_name}] N frames: {all_frames.shape[0]}", flush=True)
+
+    sample_pix = torch.from_numpy(all_frames[:5000]).float() / 255.0
+    palette = kmeans_palette_unique(sample_pix.to(device).reshape(-1, 3), K=K_PALETTE).cpu()
+    palette_t = palette.to(device)
+    print(f"[{run_name}] palette: {palette.tolist()}", flush=True)
+
+    class FrameSet(Dataset):
+        def __len__(self): return all_frames.shape[0]
+        def __getitem__(self, i):
+            return torch.from_numpy(all_frames[i]).float().permute(2, 0, 1) / 255.0
+
+    loader = DataLoader(
+        FrameSet(), batch_size=batch, shuffle=True, num_workers=4,
+        drop_last=True, pin_memory=True, persistent_workers=True,
+    )
+
+    if arch_kind == "flat":
+        enc = OracleEncoderCNN(in_channels=3, out_dim=dim).to(device)
+        dec = TinyDecoder(dim=dim, ch=128, out_channels=out_channels).to(device)
+        is_unet = False
+        is_spatial = False
+    elif arch_kind == "spatial-16":
+        enc = SpatialEncoder(in_channels=3, dim=dim, lat_size=16).to(device)
+        dec = SpatialDecoder(dim=dim, out_channels=out_channels, lat_size=16).to(device)
+        is_unet = False
+        is_spatial = True
+    elif arch_kind == "spatial-8":
+        enc = SpatialEncoder(in_channels=3, dim=dim, lat_size=8).to(device)
+        dec = SpatialDecoder(dim=dim, out_channels=out_channels, lat_size=8).to(device)
+        is_unet = False
+        is_spatial = True
+    elif arch_kind == "unet-tiny":
+        unet = UNetAE(in_channels=3, out_channels=out_channels, base_ch=16).to(device)
+        is_unet = True
+        is_spatial = False
+        enc = unet
+        dec = unet
+    elif arch_kind == "unet-base":
+        unet = UNetAE(in_channels=3, out_channels=out_channels, base_ch=32).to(device)
+        is_unet = True
+        is_spatial = False
+        enc = unet
+        dec = unet
+    else:
+        raise ValueError(arch_kind)
+
+    if is_unet:
+        params = list(enc.parameters())
+    else:
+        params = list(enc.parameters()) + list(dec.parameters())
+    n_params = sum(p.numel() for p in params)
+    print(f"[{run_name}] params: {n_params/1e6:.2f}M  steps/epoch: {len(loader)}", flush=True)
+
+    opt = torch.optim.AdamW(params, lr=lr, weight_decay=1e-3)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs * len(loader))
+
+    run_dir = Path(CKPT_DIR, run_name)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    cfg = dict(
+        run_name=run_name, mode="arch_ae", arch_kind=arch_kind,
+        loss_kind=loss_kind, dim=dim, K=K_PALETTE, out_channels=out_channels,
+        epochs=epochs, batch=batch, num_episodes=num_episodes,
+    )
+    (run_dir / "config.json").write_text(json.dumps(cfg, indent=2))
+
+    train_t0 = time.time()
+    for epoch in range(epochs):
+        enc.train()
+        if not is_unet:
+            dec.train()
+        total = 0.0; n = 0
+        ep_t0 = time.time()
+        for f in loader:
+            f = f.to(device, non_blocking=True)
+            with torch.amp.autocast(**autocast_kw):
+                if is_unet:
+                    raw = enc(f)
+                else:
+                    z = enc(f)
+                    raw = dec(z)
+                loss = oracle_decoder_loss(raw, f, loss_kind, K=K_PALETTE, palette=palette_t)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(params, 1.0)
+            opt.step(); sched.step()
+            total += loss.item(); n += 1
+
+        payload = {
+            "epoch": epoch + 1, "stage": "arch_ae",
+            "encoder_state": enc.state_dict() if not is_unet else None,
+            "decoder_state": dec.state_dict() if not is_unet else None,
+            "unet_state": enc.state_dict() if is_unet else None,
+            "palette": palette,
+            "cfg": cfg,
+            "loss": total / max(n, 1),
+        }
+        torch.save(payload, run_dir / f"epoch_{epoch+1:03d}.pt")
+        torch.save(payload, run_dir / "latest.pt")
+        vol.commit()
+        print(f"[{run_name}] ep {epoch+1}/{epochs} loss={total/n:.4f} ({time.time()-ep_t0:.1f}s)", flush=True)
+
+    print(f"[{run_name}] DONE in {time.time()-train_t0:.0f}s", flush=True)
+
+
+# Architecture ablation: same loss (per-class CE), vary architecture. All pure AE.
+ARCH_RUNS = [
+    # (run_name,           arch_kind)
+    ("arch-flat-control",  "flat"),         # control: existing flat 16-d global latent
+    ("arch-spatial-16",    "spatial-16"),   # 16-channel spatial latent at 16x16
+    ("arch-spatial-8",     "spatial-8"),    # 16-channel spatial latent at 8x8
+    ("arch-unet-tiny",     "unet-tiny"),    # U-Net with skip connections, base_ch=16
+    ("arch-unet-base",     "unet-base"),    # U-Net base_ch=32
+]
+
+
 # Class-balance ablation: TRUE root-cause is per-pixel loss averaging.
 # GT distribution: BG=4090, body=4, head=1, food=1 (per 4096-pixel frame).
 # Plain CE means head/food contribute 1/4096 of the gradient -> never learned.
@@ -1167,23 +1329,10 @@ def train_manifold(
 
 @app.local_entrypoint()
 def main():
-    print(f"Spawning {len(BG_DIAG_RUNS)} parallel A10G jobs (bottleneck-capacity DIAGNOSTIC) ...")
-    for run_name, dim, pl, sl, dl, lk, fg, bgw in BG_DIAG_RUNS:
-        h = train_full.spawn(
-            run_name=run_name,
-            predictor_kind="mlp",
-            dec_noise=0.0,
-            multi_step=1,
-            dec_grad=True,
-            dim=dim,
-            pred_lambda=pl,
-            sigreg_lambda=sl,
-            dec_lambda=dl,
-            loss_kind=lk,
-            focal_gamma=fg,
-            bg_weight=bgw,
-        )
-        print(f"  spawned {run_name}: {h.object_id}")
+    print(f"Spawning {len(ARCH_RUNS)} parallel A10G jobs (architecture ablation, pure AE) ...")
+    for run_name, arch_kind in ARCH_RUNS:
+        h = train_arch_ae.spawn(run_name=run_name, arch_kind=arch_kind)
+        print(f"  spawned {run_name} ({arch_kind}): {h.object_id}")
     print("All jobs spawned.")
     return
     # legacy entrypoint below

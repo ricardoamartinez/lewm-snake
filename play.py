@@ -137,6 +137,135 @@ def render_oracle_output(raw, loss_kind, K=None, palette=None):
     return model_render_oracle(raw, loss_kind, K=K, palette=palette)
 
 
+def run_arch_ae_play(args, ckpt_path):
+    """Pure-AE replay: real frame -> encoder -> decoder -> reconstruction.
+    Left = real Snake, right = AE reconstruction. No predictor.
+    Tests whether the architecture can render snake/food correctly per-frame.
+    """
+    import pygame
+    from snake import Snake
+    from model import (
+        OracleEncoderCNN, TinyDecoder, UNetAE, SpatialEncoder, SpatialDecoder,
+        render_oracle_output,
+    )
+
+    blob = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    cfg = blob["cfg"]
+    arch = cfg["arch_kind"]
+    dim = cfg["dim"]; K = cfg["K"]
+    out_channels = cfg["out_channels"]
+    palette = blob["palette"]
+    if not isinstance(palette, torch.Tensor): palette = torch.tensor(palette)
+
+    is_unet = arch.startswith("unet")
+    if arch == "flat":
+        enc = OracleEncoderCNN(in_channels=3, out_dim=dim)
+        dec = TinyDecoder(dim=dim, ch=128, out_channels=out_channels)
+    elif arch == "spatial-16":
+        enc = SpatialEncoder(in_channels=3, dim=dim, lat_size=16)
+        dec = SpatialDecoder(dim=dim, out_channels=out_channels, lat_size=16)
+    elif arch == "spatial-8":
+        enc = SpatialEncoder(in_channels=3, dim=dim, lat_size=8)
+        dec = SpatialDecoder(dim=dim, out_channels=out_channels, lat_size=8)
+    elif arch == "unet-tiny":
+        unet = UNetAE(in_channels=3, out_channels=out_channels, base_ch=16)
+        enc = unet; dec = unet
+    elif arch == "unet-base":
+        unet = UNetAE(in_channels=3, out_channels=out_channels, base_ch=32)
+        enc = unet; dec = unet
+    else:
+        raise ValueError(arch)
+
+    if is_unet:
+        enc.load_state_dict(blob["unet_state"])
+    else:
+        enc.load_state_dict(blob["encoder_state"])
+        dec.load_state_dict(blob["decoder_state"])
+    enc.eval()
+    if not is_unet:
+        dec.eval()
+    enc = enc.to(args.device)
+    if not is_unet:
+        dec = dec.to(args.device)
+    ep = blob.get("epoch", "?")
+
+    pygame.init()
+    cell = 64 * args.scale
+    screen = pygame.display.set_mode((cell * 2 + 8, cell + 40))
+    title = f"LeWM-Snake AE [{args.run}] ep={ep} arch={arch}"
+    pygame.display.set_caption(title)
+    font = pygame.font.SysFont("monospace", 14)
+    clock = pygame.time.Clock()
+
+    KEY_TO_ACTION = {
+        pygame.K_UP: 0, pygame.K_w: 0, pygame.K_DOWN: 1, pygame.K_s: 1,
+        pygame.K_LEFT: 2, pygame.K_a: 2, pygame.K_RIGHT: 3, pygame.K_d: 3,
+    }
+    NAMES = {0: "UP", 1: "DOWN", 2: "LEFT", 3: "RIGHT"}
+
+    rng = np.random.default_rng(int(time.time()) & 0xFFFF)
+    env = Snake(seed=int(rng.integers(1 << 30)))
+    current_action = 3
+    step_idx = 0
+    running = True
+    while running:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key in (pygame.K_q, pygame.K_ESCAPE):
+                    running = False
+                elif event.key == pygame.K_r:
+                    new_ckpt = pull_checkpoint("latest.pt", run=args.run)
+                    if new_ckpt.exists():
+                        blob2 = torch.load(new_ckpt, map_location="cpu", weights_only=False)
+                        if is_unet:
+                            enc.load_state_dict(blob2["unet_state"])
+                        else:
+                            enc.load_state_dict(blob2["encoder_state"])
+                            dec.load_state_dict(blob2["decoder_state"])
+                        ep = blob2.get("epoch", "?")
+                        pygame.display.set_caption(f"LeWM-Snake AE [{args.run}] ep={ep} arch={arch}")
+                elif event.key == pygame.K_n:
+                    env = Snake(seed=int(rng.integers(1 << 30)))
+                    step_idx = 0
+                elif event.key in KEY_TO_ACTION:
+                    current_action = KEY_TO_ACTION[event.key]
+
+        _, done = env.step(current_action)
+        if done:
+            env = Snake(seed=int(rng.integers(1 << 30)))
+            step_idx = 0
+            continue
+        real_frame = env.render()
+        f = torch.from_numpy(real_frame).float().permute(2, 0, 1).unsqueeze(0).to(args.device) / 255.0
+        with torch.no_grad():
+            if is_unet:
+                raw = enc(f)
+            else:
+                z = enc(f)
+                raw = dec(z)
+            recon = render_oracle_output(raw, "cat-kmeans-unique", K=K, palette=palette).clamp(0, 1)[0]
+
+        screen.fill((0, 0, 0))
+        real_surf = pygame.surfarray.make_surface(real_frame.swapaxes(0, 1))
+        real_surf = pygame.transform.scale(real_surf, (cell, cell))
+        screen.blit(real_surf, (0, 0))
+        rec_arr = (recon.cpu().numpy().transpose(1, 2, 0) * 255).clip(0, 255).round().astype(np.uint8)
+        rec_surf = pygame.surfarray.make_surface(rec_arr.swapaxes(0, 1))
+        rec_surf = pygame.transform.scale(rec_surf, (cell, cell))
+        screen.blit(rec_surf, (cell + 8, 0))
+        info = font.render(
+            f"ep={ep}  arch={arch}  step={step_idx}  L=REAL  R=AE-RECON",
+            True, (200, 200, 200),
+        )
+        screen.blit(info, (8, cell + 12))
+        pygame.display.flip()
+        clock.tick(args.fps)
+        step_idx += 1
+    pygame.quit()
+
+
 def run_full_play(args, ckpt_path):
     """Full-system replay: pixel encoder reads real frames once at reset to seed,
     then predictor + decoder roll out forever under user keypresses.
@@ -545,6 +674,10 @@ def main():
     if mode == "full":
         print(f"[play] {args.run or '?'}: full-system (pixel encoder + predictor + decoder) mode")
         run_full_play(args, ckpt)
+        return
+    if mode == "arch_ae":
+        print(f"[play] {args.run or '?'}: arch-AE mode (no predictor — encode/decode every real frame)")
+        run_arch_ae_play(args, ckpt)
         return
 
     model, ep, step = load_model(ckpt)

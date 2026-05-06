@@ -323,21 +323,17 @@ def train_predictor(
     print(f"[{run_name}] DONE", flush=True)
 
 
-# BG-collapse diagnostic ablation: WHY does the model paint all-BG on epoch 1?
-# Each variant disables ONE thing to find out who's at fault.
-# All use mlp predictor, dec_grad=True, dim=16, 50 epochs.
+# Bottleneck-capacity diagnostic ablation:
+# All previous BG-fixes failed → the 16-d FLAT bottleneck likely cannot encode
+# snake/food positions through the encoder in 1 epoch. Sweep dim to confirm.
+# All variants: pure AE (no predictor, no sigreg), plain CE on K-means-unique palette.
 BG_DIAG_RUNS = [
-    # (run_name,           pred_lambda, sigreg_lambda, dec_lambda, loss_kind,             focal_gamma, bg_weight)
-    # 1) Pure AE, plain CE — does even a SUPERVISED autoencoder paint snake/food on ep1?
-    ("bg-ae-plainCE",      0.0,         0.0,           1.0,        "cat-kmeans-unique",   0.0,         0.0),
-    # 2) Pure AE, focal CE γ=2 — incremental: focal on top of AE
-    ("bg-ae-focalg2",      0.0,         0.0,           1.0,        "cat-kmeans-focal",    2.0,         0.0),
-    # 3) Pure AE, fg-only — extreme imbalance fix (BG completely ignored in loss)
-    ("bg-ae-fgonly",       0.0,         0.0,           1.0,        "cat-kmeans-fgonly",   0.0,         0.0),
-    # 4) Full system, focal γ=5 — much more aggressive focal
-    ("bg-full-focalg5",    1.0,         0.1,           1.0,        "cat-kmeans-focal",    5.0,         0.0),
-    # 5) Full system, dec_loss×10 — same loss but force dec gradient to dominate
-    ("bg-full-dec10x",     1.0,         0.1,           10.0,       "cat-kmeans-focal",    2.0,         0.0),
+    # (run_name,         dim,    pred_lambda, sigreg_lambda, dec_lambda, loss_kind,             focal_gamma, bg_weight)
+    ("dim-16-control",   16,     0.0,         0.0,           1.0,        "cat-kmeans-unique",   0.0,         0.0),
+    ("dim-64",           64,     0.0,         0.0,           1.0,        "cat-kmeans-unique",   0.0,         0.0),
+    ("dim-256",          256,    0.0,         0.0,           1.0,        "cat-kmeans-unique",   0.0,         0.0),
+    ("dim-1024",         1024,   0.0,         0.0,           1.0,        "cat-kmeans-unique",   0.0,         0.0),
+    ("dim-4096",         4096,   0.0,         0.0,           1.0,        "cat-kmeans-unique",   0.0,         0.0),
 ]
 
 
@@ -1151,14 +1147,15 @@ def train_manifold(
 
 @app.local_entrypoint()
 def main():
-    print(f"Spawning {len(BG_DIAG_RUNS)} parallel A10G jobs (BG-collapse DIAGNOSTIC ablation) ...")
-    for run_name, pl, sl, dl, lk, fg, bgw in BG_DIAG_RUNS:
+    print(f"Spawning {len(BG_DIAG_RUNS)} parallel A10G jobs (bottleneck-capacity DIAGNOSTIC) ...")
+    for run_name, dim, pl, sl, dl, lk, fg, bgw in BG_DIAG_RUNS:
         h = train_full.spawn(
             run_name=run_name,
             predictor_kind="mlp",
             dec_noise=0.0,
             multi_step=1,
             dec_grad=True,
+            dim=dim,
             pred_lambda=pl,
             sigreg_lambda=sl,
             dec_lambda=dl,

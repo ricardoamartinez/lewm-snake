@@ -324,6 +324,198 @@ def train_predictor(
 
 
 # Pinpoint ablation: same loss + dim=16 latent, vary one axis
+FULL_SYSTEM_RUNS = [
+    # (run_name, predictor_kind, dec_noise, multi_step)
+    ("full-mlp",          "mlp",       0.0, 1),
+    ("full-residual",     "residual",  0.0, 1),
+    ("full-multistep",    "mlp",       0.0, 4),
+    ("full-decnoise",     "mlp",       0.3, 1),
+    ("full-kitchensink",  "residual",  0.3, 4),
+]
+
+
+@app.function(
+    image=image,
+    gpu="A10G",
+    volumes={CKPT_DIR: vol},
+    timeout=60 * 60,
+)
+def train_full(
+    run_name: str,
+    predictor_kind: str,
+    dec_noise: float,
+    multi_step: int,
+    epochs: int = 25,
+    batch: int = 256,
+    lr: float = 5e-4,
+    sigreg_lambda: float = 0.1,
+    num_episodes: int = 1500,
+    history: int = 4,
+    pred_horizon: int = 4,
+    dim: int = 64,
+    seed: int = 0,
+):
+    import json
+    import numpy as np
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    from torch.utils.data import Dataset, DataLoader
+
+    from snake import generate_dataset
+    from model import (
+        OracleEncoderCNN, TinyDecoder, SIGReg, kmeans_palette_unique,
+        oracle_decoder_loss, oracle_decoder_out_channels, make_predictor,
+    )
+
+    torch.set_float32_matmul_precision("high")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    use_bf16 = device == "cuda"
+    autocast_kw = dict(device_type="cuda", dtype=torch.bfloat16) if use_bf16 else dict(device_type="cpu", enabled=False)
+
+    K_PALETTE = 8
+    out_channels = oracle_decoder_out_channels("cat-kmeans-unique", K=K_PALETTE)
+    print(f"[{run_name}] FULL: predictor={predictor_kind} dec_noise={dec_noise} "
+          f"multi_step={multi_step} dim={dim} epochs={epochs}", flush=True)
+
+    print(f"[{run_name}] generating {num_episodes} episodes ...", flush=True)
+    t0 = time.time()
+    frames_list, actions_list = generate_dataset(num_episodes, seed=seed)
+    print(f"[{run_name}] dataset built in {time.time()-t0:.1f}s", flush=True)
+
+    # Build sliding windows (T = history + pred_horizon frames)
+    T = history + pred_horizon
+    windows = []
+    for f, a in zip(frames_list, actions_list):
+        if len(f) < T:
+            continue
+        for i in range(len(f) - T + 1):
+            windows.append((f[i:i + T], a[i:i + T - 1]))
+    print(f"[{run_name}] training windows: {len(windows)}  T={T}", flush=True)
+
+    class WMSet(Dataset):
+        def __len__(self): return len(windows)
+        def __getitem__(self, idx):
+            f, a = windows[idx]
+            return torch.from_numpy(f).float().permute(0, 3, 1, 2) / 255.0, torch.from_numpy(a).long()
+
+    loader = DataLoader(
+        WMSet(), batch_size=batch, shuffle=True, num_workers=4,
+        drop_last=True, pin_memory=True, persistent_workers=True,
+    )
+
+    # K-means palette on UNIQUE colors (channel-last reshape — correct triplets)
+    sample_pix = torch.from_numpy(np.stack([f for fr in frames_list[:200] for f in fr])).float() / 255.0  # (N, 64, 64, 3)
+    palette = kmeans_palette_unique(sample_pix.to(device).reshape(-1, 3), K=K_PALETTE).cpu()
+    palette_t = palette.to(device)
+    print(f"[{run_name}] palette: {palette.tolist()}", flush=True)
+
+    # Build full system: pixel CNN encoder + predictor + decoder
+    enc = OracleEncoderCNN(in_channels=3, out_dim=dim).to(device)
+    pred = make_predictor(predictor_kind, dim=dim).to(device)
+    dec = TinyDecoder(dim=dim, ch=128, out_channels=out_channels).to(device)
+    action_embed = nn.Embedding(4, dim).to(device)
+    sigreg = SIGReg(knots=17, num_proj=512).to(device)
+
+    n_params = (sum(p.numel() for p in enc.parameters())
+                + sum(p.numel() for p in pred.parameters())
+                + sum(p.numel() for p in dec.parameters())
+                + sum(p.numel() for p in action_embed.parameters()))
+    print(f"[{run_name}] params: {n_params/1e6:.2f}M  steps/epoch: {len(loader)}", flush=True)
+
+    opt = torch.optim.AdamW(
+        list(enc.parameters()) + list(pred.parameters()) + list(dec.parameters())
+        + list(action_embed.parameters()), lr=lr, weight_decay=1e-3,
+    )
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs * len(loader))
+
+    run_dir = Path(CKPT_DIR, run_name)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    cfg = dict(
+        run_name=run_name, mode="full", encoder_kind="pixel-cnn",
+        predictor_kind=predictor_kind, dec_noise=dec_noise, multi_step=multi_step,
+        history=history, pred_horizon=pred_horizon, dim=dim,
+        K=K_PALETTE, out_channels=out_channels, decoder_kind="convt",
+        num_episodes=num_episodes, batch=batch, epochs=epochs,
+    )
+    (run_dir / "config.json").write_text(json.dumps(cfg, indent=2))
+
+    train_t0 = time.time()
+    for epoch in range(epochs):
+        enc.train(); pred.train(); dec.train(); action_embed.train()
+        agg = {"loss": 0.0, "pred": 0.0, "sigreg": 0.0, "decoder": 0.0}
+        n = 0
+        ep_t0 = time.time()
+        for f, a in loader:
+            f = f.to(device, non_blocking=True)                                   # (B, T, 3, 64, 64)
+            a = a.to(device, non_blocking=True)                                   # (B, T-1)
+            with torch.amp.autocast(**autocast_kw):
+                B, T_, C, H, W = f.shape
+                emb = enc(f.reshape(B * T_, C, H, W)).reshape(B, T_, dim)         # (B, T, dim)
+                act_emb = action_embed(a)                                          # (B, T-1, dim)
+
+                # JEPA prediction loss (multi-step teacher-forced)
+                pred_loss = emb.new_zeros(())
+                steps_used = 0
+                for k in range(min(multi_step, T_ - 1)):
+                    if predictor_kind == "transformer":
+                        z_hat = pred.step(emb[:, :T_ - 1 - k], act_emb[:, :T_ - 1 - k])
+                    elif predictor_kind == "rnn":
+                        z_hat, _ = pred(emb[:, k], act_emb[:, k])
+                    else:
+                        z_hat = pred(emb[:, k], act_emb[:, k])
+                    target = emb[:, k + 1].detach()
+                    pred_loss = pred_loss + (z_hat - target).pow(2).mean()
+                    steps_used += 1
+                pred_loss = pred_loss / max(steps_used, 1)
+
+                # SIGReg on the encoder output (T, B, D)
+                sigreg_loss = sigreg(emb.transpose(0, 1))
+
+                # Decoder loss with optional noise injection (latent stop-grad → decoder is post-hoc)
+                z_flat = emb.detach().reshape(B * T_, dim)
+                if dec_noise > 0:
+                    z_flat = z_flat + dec_noise * torch.randn_like(z_flat)
+                raw = dec(z_flat)
+                pix_target = f.reshape(B * T_, 3, H, W)
+                dec_loss = oracle_decoder_loss(raw, pix_target, "cat-kmeans-unique",
+                                                K=K_PALETTE, palette=palette_t)
+
+                loss = pred_loss + sigreg_lambda * sigreg_loss + dec_loss
+
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                list(enc.parameters()) + list(pred.parameters()) + list(dec.parameters())
+                + list(action_embed.parameters()), 1.0,
+            )
+            opt.step(); sched.step()
+            agg["loss"] += loss.item()
+            agg["pred"] += pred_loss.item(); agg["sigreg"] += sigreg_loss.item()
+            agg["decoder"] += dec_loss.item()
+            n += 1
+
+        payload = {
+            "epoch": epoch + 1, "stage": "full",
+            "encoder_state": enc.state_dict(),
+            "decoder_state": dec.state_dict(),
+            "predictor_state": pred.state_dict(),
+            "action_embed_state": action_embed.state_dict(),
+            "palette": palette,
+            "cfg": cfg,
+            **{k: agg[k] / max(n, 1) for k in agg},
+        }
+        torch.save(payload, run_dir / f"epoch_{epoch+1:03d}.pt")
+        torch.save(payload, run_dir / "latest.pt")
+        vol.commit()
+        print(f"[{run_name}] ep {epoch+1}/{epochs} "
+              f"loss={agg['loss']/n:.4f} pred={agg['pred']/n:.4f} "
+              f"sigreg={agg['sigreg']/n:.4f} dec={agg['decoder']/n:.4f} "
+              f"({time.time()-ep_t0:.1f}s)", flush=True)
+
+    print(f"[{run_name}] DONE in {time.time()-train_t0:.0f}s", flush=True)
+
+
 PINPOINT_RUNS = [
     # (run_name, state_encoding, decoder_kind, freq_K, deep_cnn)
     ("pin-baseline",      "sinusoidal", "convt",   8,  False),
@@ -932,21 +1124,15 @@ def train_manifold(
 
 @app.local_entrypoint()
 def main():
-    print(f"Spawning {len(MANIFOLD_FIX_RUNS)} parallel H100 jobs (manifold-drift fixes) ...")
-    for cfg in MANIFOLD_FIX_RUNS:
-        name, pred, quant, joint, oep, pep, ploss, mstep, dnoise = cfg
-        h = train_manifold.spawn(
-            run_name=name,
-            predictor_kind=pred,
-            quantizer_kind=quant,
-            joint=joint,
-            oracle_epochs=oep,
-            pred_epochs=pep,
-            pred_loss_kind=ploss,
+    print(f"Spawning {len(FULL_SYSTEM_RUNS)} parallel A10G jobs (FULL SYSTEM) ...")
+    for run_name, pred_kind, dn, mstep in FULL_SYSTEM_RUNS:
+        h = train_full.spawn(
+            run_name=run_name,
+            predictor_kind=pred_kind,
+            dec_noise=dn,
             multi_step=mstep,
-            decoder_noise=dnoise,
         )
-        print(f"  spawned {name}: {h.object_id}")
+        print(f"  spawned {run_name}: {h.object_id}")
     print("All jobs spawned.")
     return
     # legacy entrypoint below

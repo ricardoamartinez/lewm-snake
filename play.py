@@ -137,6 +137,128 @@ def render_oracle_output(raw, loss_kind, K=None, palette=None):
     return model_render_oracle(raw, loss_kind, K=K, palette=palette)
 
 
+def run_full_play(args, ckpt_path):
+    """Full-system replay: pixel encoder reads real frames once at reset to seed,
+    then predictor + decoder roll out forever under user keypresses.
+    Left = real Snake env, right = imagined."""
+    import pygame
+    import torch.nn as nn
+    from snake import Snake
+    from model import OracleEncoderCNN, TinyDecoder, make_predictor, render_oracle_output
+
+    blob = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    cfg = blob["cfg"]
+    dim = cfg["dim"]; K = cfg["K"]
+    enc = OracleEncoderCNN(in_channels=3, out_dim=dim)
+    enc.load_state_dict(blob["encoder_state"]); enc.eval()
+    dec = TinyDecoder(dim=dim, ch=128, out_channels=cfg["out_channels"])
+    dec.load_state_dict(blob["decoder_state"]); dec.eval()
+    pred = make_predictor(cfg["predictor_kind"], dim=dim)
+    pred.load_state_dict(blob["predictor_state"]); pred.eval()
+    act_embed = nn.Embedding(4, dim)
+    act_embed.load_state_dict(blob["action_embed_state"]); act_embed.eval()
+    palette = blob["palette"]
+    if not isinstance(palette, torch.Tensor): palette = torch.tensor(palette)
+
+    enc = enc.to(args.device); dec = dec.to(args.device)
+    pred = pred.to(args.device); act_embed = act_embed.to(args.device)
+    ep = blob.get("epoch", "?")
+
+    pygame.init()
+    cell = 64 * args.scale
+    screen = pygame.display.set_mode((cell * 2 + 8, cell + 40))
+    title = f"LeWM-Snake FULL [{args.run}] ep={ep} pred={cfg['predictor_kind']} dn={cfg.get('dec_noise', 0)}"
+    pygame.display.set_caption(title)
+    font = pygame.font.SysFont("monospace", 14)
+    clock = pygame.time.Clock()
+
+    KEY_TO_ACTION = {
+        pygame.K_UP: 0, pygame.K_w: 0, pygame.K_DOWN: 1, pygame.K_s: 1,
+        pygame.K_LEFT: 2, pygame.K_a: 2, pygame.K_RIGHT: 3, pygame.K_d: 3,
+    }
+    NAMES = {0: "UP", 1: "DOWN", 2: "LEFT", 3: "RIGHT"}
+
+    rng = np.random.default_rng(int(time.time()) & 0xFFFF)
+    env = Snake(seed=int(rng.integers(1 << 30)))
+
+    def reset_imag():
+        with torch.no_grad():
+            seed_frame = env.render()                                       # (64,64,3) uint8
+            f = torch.from_numpy(seed_frame).float().permute(2, 0, 1).unsqueeze(0).to(args.device) / 255.0
+            z0 = enc(f)                                                     # (1, dim)
+        return z0
+
+    z = reset_imag()
+    h_state = None
+    current_action = 3
+    step_idx = 0
+    running = True
+    while running:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key in (pygame.K_q, pygame.K_ESCAPE):
+                    running = False
+                elif event.key == pygame.K_r:
+                    new_ckpt = pull_checkpoint("latest.pt", run=args.run)
+                    if new_ckpt.exists():
+                        blob2 = torch.load(new_ckpt, map_location="cpu", weights_only=False)
+                        enc.load_state_dict(blob2["encoder_state"])
+                        dec.load_state_dict(blob2["decoder_state"])
+                        pred.load_state_dict(blob2["predictor_state"])
+                        act_embed.load_state_dict(blob2["action_embed_state"])
+                        ep = blob2.get("epoch", "?")
+                        pygame.display.set_caption(
+                            f"LeWM-Snake FULL [{args.run}] ep={ep} pred={cfg['predictor_kind']} dn={cfg.get('dec_noise',0)}"
+                        )
+                        env = Snake(seed=int(rng.integers(1 << 30)))
+                        z = reset_imag(); h_state = None; step_idx = 0
+                        print(f"[play] {args.run}: reloaded epoch={ep}")
+                elif event.key == pygame.K_n:
+                    env = Snake(seed=int(rng.integers(1 << 30)))
+                    z = reset_imag(); h_state = None; step_idx = 0
+                elif event.key in KEY_TO_ACTION:
+                    current_action = KEY_TO_ACTION[event.key]
+
+        _, done = env.step(current_action)
+        if done:
+            env = Snake(seed=int(rng.integers(1 << 30)))
+            z = reset_imag(); h_state = None; step_idx = 0
+            continue
+        real_frame = env.render()
+
+        with torch.no_grad():
+            a_t = act_embed(torch.tensor([current_action], device=args.device))
+            if cfg["predictor_kind"] == "transformer":
+                z_next = pred.step(z.unsqueeze(1), a_t.unsqueeze(1))
+            elif cfg["predictor_kind"] == "rnn":
+                z_next, h_state = pred(z, a_t, h_state)
+            else:
+                z_next = pred(z, a_t)
+            z = z_next
+            raw = dec(z)
+            recon = render_oracle_output(raw, "cat-kmeans-unique", K=K, palette=palette).clamp(0, 1)[0]
+
+        screen.fill((0, 0, 0))
+        real_surf = pygame.surfarray.make_surface(real_frame.swapaxes(0, 1))
+        real_surf = pygame.transform.scale(real_surf, (cell, cell))
+        screen.blit(real_surf, (0, 0))
+        rec_arr = (recon.cpu().numpy().transpose(1, 2, 0) * 255).clip(0, 255).round().astype(np.uint8)
+        rec_surf = pygame.surfarray.make_surface(rec_arr.swapaxes(0, 1))
+        rec_surf = pygame.transform.scale(rec_surf, (cell, cell))
+        screen.blit(rec_surf, (cell + 8, 0))
+        info = font.render(
+            f"ep={ep}  step={step_idx}  action={NAMES[current_action]}  L=REAL  R=IMAGINED",
+            True, (200, 200, 200),
+        )
+        screen.blit(info, (8, cell + 12))
+        pygame.display.flip()
+        clock.tick(args.fps)
+        step_idx += 1
+    pygame.quit()
+
+
 def run_predictor_play(args, ckpt_path):
     """Side-by-side interactive: left = real Snake env, right = imagined rollout
     via frozen oracle decoder + trainable predictor. Both driven by the same
@@ -419,6 +541,10 @@ def main():
     if mode == "predictor":
         print(f"[play] {args.run or '?'}: predictor (frozen-oracle world model) mode")
         run_predictor_play(args, ckpt)
+        return
+    if mode == "full":
+        print(f"[play] {args.run or '?'}: full-system (pixel encoder + predictor + decoder) mode")
+        run_full_play(args, ckpt)
         return
 
     model, ep, step = load_model(ckpt)

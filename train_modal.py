@@ -517,16 +517,17 @@ def train_arch_jepa(
     print(f"[{run_name}] DONE in {time.time()-train_t0:.0f}s", flush=True)
 
 
-# JEPA architecture ablation: full system (encoder + predictor + decoder).
-# Spatial latents preserve positional info so predictor + decoder can render snake/food
-# at exact pixel positions during imagined rollout.
+# JEPA architecture ablation v2: pred_loss was 140x bigger than dec_loss with
+# unscaled MSE on 16-d latents. Drop pred_lambda to ~0 so dec gradient (via rollout)
+# trains everything end-to-end. Predictor still evolves latent under action via
+# the rollout chain — gradient just comes purely from pixel reconstruction.
 ARCH_RUNS = [
-    # (run_name,           arch_kind)
-    ("jepa-flat-control",  "flat"),         # flat 16-d + MLP predictor (broken control)
-    ("jepa-spatial-16",    "spatial-16"),   # (16, 16, 16) latent + ConvPredictor
-    ("jepa-spatial-8",     "spatial-8"),    # (16, 8, 8) + ConvPredictor
-    ("jepa-spatial-4",     "spatial-4"),    # (16, 4, 4) + ConvPredictor
-    ("jepa-spatial-16-tf", "spatial-16"),   # spatial-16 with rollout_dec=False (manifold-locked dec)
+    # (run_name,                arch_kind,    pred_lambda)
+    ("jepa2-flat-pl0",          "flat",        0.0),
+    ("jepa2-spatial-16-pl0",    "spatial-16",  0.0),
+    ("jepa2-spatial-8-pl0",     "spatial-8",   0.0),
+    ("jepa2-spatial-4-pl0",     "spatial-4",   0.0),
+    ("jepa2-spatial-16-pl001",  "spatial-16",  0.01),  # tiny aux pred loss
 ]
 
 
@@ -1374,13 +1375,13 @@ def train_manifold(
 
 @app.local_entrypoint()
 def main():
-    print(f"Spawning {len(ARCH_RUNS)} parallel A10G jobs (JEPA architecture ablation) ...")
-    for run_name, arch_kind in ARCH_RUNS:
-        rollout_dec = (run_name != "jepa-spatial-16-tf")  # only -tf uses teacher-forced dec
+    print(f"Spawning {len(ARCH_RUNS)} parallel A10G jobs (JEPA arch v2: pred_lambda~0) ...")
+    for run_name, arch_kind, pl in ARCH_RUNS:
         h = train_arch_jepa.spawn(
-            run_name=run_name, arch_kind=arch_kind, rollout_dec=rollout_dec,
+            run_name=run_name, arch_kind=arch_kind,
+            rollout_dec=True, pred_lambda=pl,
         )
-        print(f"  spawned {run_name} ({arch_kind}, rollout_dec={rollout_dec}): {h.object_id}")
+        print(f"  spawned {run_name} ({arch_kind}, pred_lambda={pl}): {h.object_id}")
     print("All jobs spawned.")
     return
     # legacy entrypoint below

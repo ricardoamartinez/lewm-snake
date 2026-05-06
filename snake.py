@@ -263,11 +263,12 @@ def generate_dataset(num_episodes, seed=0):
     return frames_all, actions_all
 
 
-def generate_oracle_dataset(num_episodes, seed=0, encoding="baseline"):
-    """Returns (frames_list, states_list).
-    states_list[i] shape: (T, 99) for baseline/onehot/sinusoidal, (T, 4, 64, 64) for spatial."""
+def generate_oracle_dataset(num_episodes, seed=0, encoding="baseline", return_actions=False):
+    """Returns (frames_list, states_list[, actions_list]).
+    states_list[i] shape: (T, D) for baseline/onehot/sinusoidal, (T, 4, 64, 64) for spatial.
+    actions_list[i] shape: (T-1,) — action that took states[i][t] -> states[i][t+1]."""
     rng = np.random.default_rng(seed + 9_000_000)
-    frames_all, states_all = [], []
+    frames_all, states_all, actions_all = [], [], []
     for i in range(num_episodes):
         env = Snake(seed=seed + i)
         frames = [env.render()]
@@ -283,6 +284,9 @@ def generate_oracle_dataset(num_episodes, seed=0, encoding="baseline"):
                 break
         frames_all.append(np.stack(frames))
         states_all.append(np.stack(states))
+        actions_all.append(np.array(actions, dtype=np.int64))
+    if return_actions:
+        return frames_all, states_all, actions_all
     return frames_all, states_all
 
 

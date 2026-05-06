@@ -137,6 +137,144 @@ def render_oracle_output(raw, loss_kind, K=None, palette=None):
     return model_render_oracle(raw, loss_kind, K=K, palette=palette)
 
 
+def run_predictor_play(args, ckpt_path):
+    """Side-by-side interactive: left = real Snake env, right = imagined rollout
+    via frozen oracle decoder + trainable predictor. Both driven by the same
+    keypress."""
+    import pygame
+    import torch.nn as nn
+    from snake import Snake, state_features_v2
+    from model import OracleEncoderCNN, TinyDecoder, make_predictor, render_oracle_output
+
+    blob = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    cfg = blob["cfg"]
+    dim = cfg["dim"]
+    K = cfg["K"]
+    enc = OracleEncoderCNN(in_channels=4, out_dim=dim)
+    enc.load_state_dict(blob["encoder_state"]); enc.eval()
+    dec = TinyDecoder(dim=dim, ch=128, out_channels=cfg["out_channels"])
+    dec.load_state_dict(blob["decoder_state"]); dec.eval()
+    pred = make_predictor(cfg["predictor_kind"], dim=dim)
+    pred.load_state_dict(blob["predictor_state"]); pred.eval()
+    act_embed = nn.Embedding(4, dim)
+    act_embed.load_state_dict(blob["action_embed_state"]); act_embed.eval()
+    palette = blob["palette"]
+    if not isinstance(palette, torch.Tensor):
+        palette = torch.tensor(palette)
+
+    enc = enc.to(args.device); dec = dec.to(args.device); pred = pred.to(args.device); act_embed = act_embed.to(args.device)
+    history_size = cfg.get("history", 1)
+    ep = blob.get("epoch", "?")
+
+    pygame.init()
+    cell = 64 * args.scale
+    w = cell * 2 + 8
+    h = cell + 40
+    screen = pygame.display.set_mode((w, h))
+    title = f"LeWM-Snake [{args.run}] ep={ep} pred={cfg['predictor_kind']}"
+    pygame.display.set_caption(title)
+    font = pygame.font.SysFont("monospace", 14)
+    clock = pygame.time.Clock()
+
+    KEY_TO_ACTION = {
+        pygame.K_UP: 0, pygame.K_w: 0, pygame.K_DOWN: 1, pygame.K_s: 1,
+        pygame.K_LEFT: 2, pygame.K_a: 2, pygame.K_RIGHT: 3, pygame.K_d: 3,
+    }
+    NAMES = {0: "UP", 1: "DOWN", 2: "LEFT", 3: "RIGHT"}
+
+    rng = np.random.default_rng(int(time.time()) & 0xFFFF)
+    env = Snake(seed=int(rng.integers(1 << 30)))
+
+    def reset_imag():
+        s = state_features_v2(env, encoding="spatial")
+        with torch.no_grad():
+            z0 = enc(torch.from_numpy(s).unsqueeze(0).to(args.device))         # (1, dim)
+        z_hist = z0.unsqueeze(1)                                                # (1, 1, dim)
+        a_hist = torch.zeros(1, 1, dim, device=args.device)
+        h_state = None
+        return z_hist, a_hist, h_state
+
+    z_hist, a_hist, h_state = reset_imag()
+    current_action = 3
+    step_idx = 0
+
+    running = True
+    while running:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key in (pygame.K_q, pygame.K_ESCAPE):
+                    running = False
+                elif event.key == pygame.K_r:
+                    new_ckpt = pull_checkpoint("latest.pt", run=args.run)
+                    if new_ckpt.exists():
+                        # reload
+                        blob2 = torch.load(new_ckpt, map_location="cpu", weights_only=False)
+                        enc.load_state_dict(blob2["encoder_state"])
+                        dec.load_state_dict(blob2["decoder_state"])
+                        pred.load_state_dict(blob2["predictor_state"])
+                        act_embed.load_state_dict(blob2["action_embed_state"])
+                        ep = blob2.get("epoch", "?")
+                        pygame.display.set_caption(f"LeWM-Snake [{args.run}] ep={ep} pred={cfg['predictor_kind']}")
+                        env = Snake(seed=int(rng.integers(1 << 30)))
+                        z_hist, a_hist, h_state = reset_imag()
+                        step_idx = 0
+                        print(f"[play] {args.run}: reloaded epoch={ep}")
+                elif event.key == pygame.K_n:
+                    env = Snake(seed=int(rng.integers(1 << 30)))
+                    z_hist, a_hist, h_state = reset_imag()
+                    step_idx = 0
+                elif event.key in KEY_TO_ACTION:
+                    current_action = KEY_TO_ACTION[event.key]
+
+        # advance both sides under current_action
+        _, done = env.step(current_action)
+        if done:
+            env = Snake(seed=int(rng.integers(1 << 30)))
+            z_hist, a_hist, h_state = reset_imag()
+            step_idx = 0
+            continue
+        real_frame = env.render()
+
+        with torch.no_grad():
+            a_t = act_embed(torch.tensor([current_action], device=args.device))   # (1, dim)
+            if cfg["predictor_kind"] == "transformer":
+                # build sliding window of length history_size
+                a_hist = torch.cat([a_hist, a_t.unsqueeze(1)], dim=1)
+                if a_hist.size(1) > history_size:
+                    a_hist = a_hist[:, -history_size:]
+                z_in = z_hist[:, -history_size:] if z_hist.size(1) >= history_size else z_hist
+                z_next = pred.step(z_in, a_hist[:, -z_in.size(1):])              # (1, dim)
+            elif cfg["predictor_kind"] == "rnn":
+                z_next, h_state = pred(z_hist[:, -1], a_t, h_state)
+            else:
+                z_next = pred(z_hist[:, -1], a_t)
+            z_hist = torch.cat([z_hist, z_next.unsqueeze(1)], dim=1)
+            raw = dec(z_next)
+            recon = render_oracle_output(raw, "cat-kmeans-unique", K=K, palette=palette).clamp(0, 1)[0]
+
+        # blit
+        screen.fill((0, 0, 0))
+        real_surf = pygame.surfarray.make_surface(real_frame.swapaxes(0, 1))
+        real_surf = pygame.transform.scale(real_surf, (cell, cell))
+        screen.blit(real_surf, (0, 0))
+        rec_arr = (recon.cpu().numpy().transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
+        rec_surf = pygame.surfarray.make_surface(rec_arr.swapaxes(0, 1))
+        rec_surf = pygame.transform.scale(rec_surf, (cell, cell))
+        screen.blit(rec_surf, (cell + 8, 0))
+        info = font.render(
+            f"ep={ep}  step={step_idx}  action={NAMES[current_action]}  L=REAL  R=IMAGINED",
+            True, (200, 200, 200),
+        )
+        screen.blit(info, (8, cell + 12))
+        pygame.display.flip()
+        clock.tick(args.fps)
+        step_idx += 1
+
+    pygame.quit()
+
+
 def run_oracle_replay(args, ckpt_path):
     import pygame
     enc, dec, cfg, ep, palette = load_oracle(ckpt_path)
@@ -260,11 +398,16 @@ def main():
         print(f"[play] checkpoint not found at {ckpt}")
         sys.exit(1)
 
-    # Detect oracle-mode checkpoint
+    # Detect mode
     blob_peek = torch.load(ckpt, map_location="cpu", weights_only=False)
-    if blob_peek.get("cfg", {}).get("mode") == "oracle":
+    mode = blob_peek.get("cfg", {}).get("mode")
+    if mode == "oracle":
         print(f"[play] {args.run or '?'}: oracle replay mode")
         run_oracle_replay(args, ckpt)
+        return
+    if mode == "predictor":
+        print(f"[play] {args.run or '?'}: predictor (frozen-oracle world model) mode")
+        run_predictor_play(args, ckpt)
         return
 
     model, ep, step = load_model(ckpt)

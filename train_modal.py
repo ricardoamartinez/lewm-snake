@@ -67,6 +67,236 @@ PRECISION_RUNS = [
     ("pos-pixshuf",    "baseline",   "pixshuf"),
 ]
 
+# Frozen-oracle predictor ablation: 5 ways to learn dynamics in 16-d latent
+PREDICTOR_RUNS = [
+    # (run_name, predictor_kind, multi_step_horizon, history)
+    ("pred-mlp",         "mlp",        1, 1),
+    ("pred-residual",    "residual",   1, 1),
+    ("pred-transformer", "transformer", 1, 4),
+    ("pred-multistep",   "multistep",  4, 1),
+    ("pred-rnn",         "rnn",        1, 1),
+]
+
+
+@app.function(
+    image=image,
+    gpu="H100",
+    volumes={CKPT_DIR: vol},
+    timeout=30 * 60,
+)
+def train_predictor(
+    run_name: str,
+    predictor_kind: str,
+    multi_step: int = 1,
+    history: int = 1,
+    oracle_epochs: int = 10,
+    pred_epochs: int = 15,
+    batch: int = 256,
+    lr: float = 1e-3,
+    num_episodes: int = 1500,
+    dim: int = 16,
+    seed: int = 0,
+):
+    import json
+    import numpy as np
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    from torch.utils.data import Dataset, DataLoader
+
+    from snake import generate_oracle_dataset
+    from model import (
+        OracleEncoderCNN, TinyDecoder, kmeans_palette_unique,
+        oracle_decoder_loss, oracle_decoder_out_channels, make_predictor,
+    )
+
+    torch.set_float32_matmul_precision("high")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    use_bf16 = device == "cuda"
+    autocast_kw = dict(device_type="cuda", dtype=torch.bfloat16) if use_bf16 else dict(device_type="cpu", enabled=False)
+    K = 8
+    out_channels = oracle_decoder_out_channels("cat-kmeans-unique", K=K)
+
+    print(f"[{run_name}] predictor={predictor_kind} multi_step={multi_step} history={history} dim={dim}", flush=True)
+
+    print(f"[{run_name}] generating {num_episodes} episodes (spatial state) ...", flush=True)
+    t0 = time.time()
+    frames_list, states_list, actions_list = generate_oracle_dataset(
+        num_episodes, seed=seed, encoding="spatial", return_actions=True,
+    )
+
+    print(f"[{run_name}] dataset built in {time.time()-t0:.1f}s", flush=True)
+
+    # K-means palette on UNIQUE colors
+    sample_pix = torch.from_numpy(np.stack([f for fr in frames_list[:200] for f in fr])).float().permute(0, 3, 1, 2) / 255.0
+    palette = kmeans_palette_unique(sample_pix.to(device).reshape(-1, 3), K=K).cpu()
+    print(f"[{run_name}] palette: {palette.tolist()}", flush=True)
+
+    # Stage 1: train oracle encoder + decoder on (state, frame) pairs
+    enc = OracleEncoderCNN(in_channels=4, out_dim=dim).to(device)
+    dec = TinyDecoder(dim=dim, ch=128, out_channels=out_channels).to(device)
+
+    all_frames = []
+    all_states = []
+    all_actions_aligned = []  # action that goes from frame i to frame i+1 (last frame has no action)
+    for f, s, a in zip(frames_list, states_list, actions_list):
+        n = min(len(f), len(s), len(a) + 1)
+        all_frames.append(f[:n])
+        all_states.append(s[:n])
+        all_actions_aligned.append(np.concatenate([a[:n - 1], np.array([0], dtype=np.int64)]))  # placeholder for last
+    frames_t = torch.from_numpy(np.concatenate(all_frames, axis=0)).float().permute(0, 3, 1, 2) / 255.0
+    states_t = torch.from_numpy(np.concatenate(all_states, axis=0))
+    actions_t = torch.from_numpy(np.concatenate(all_actions_aligned, axis=0))
+    # Build episode boundaries (which transitions are valid, i.e., not the last frame of an episode)
+    ep_lengths = np.array([len(s) for s in all_states])
+    ep_ends = np.cumsum(ep_lengths) - 1   # the index of the last frame of each episode
+    valid_transition = np.ones(len(states_t), dtype=bool)
+    valid_transition[ep_ends] = False     # no transition out of the last frame
+    valid_idx_t = torch.from_numpy(np.where(valid_transition)[0]).long()
+
+    print(f"[{run_name}] N frames {frames_t.size(0)}, N transitions {valid_idx_t.size(0)}", flush=True)
+
+    class FrameSet(Dataset):
+        def __len__(self): return frames_t.size(0)
+        def __getitem__(self, i): return states_t[i], frames_t[i]
+
+    loader = DataLoader(FrameSet(), batch_size=batch, shuffle=True, num_workers=2, drop_last=True, pin_memory=True, persistent_workers=True)
+    opt = torch.optim.AdamW(list(enc.parameters()) + list(dec.parameters()), lr=lr)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=oracle_epochs * len(loader))
+    palette_t = palette.to(device)
+
+    print(f"[{run_name}] stage 1: training oracle encoder+decoder for {oracle_epochs} epochs", flush=True)
+    for epoch in range(oracle_epochs):
+        enc.train(); dec.train()
+        ep_t0 = time.time()
+        total = 0.0; n = 0
+        for state, frame in loader:
+            state = state.to(device, non_blocking=True)
+            frame = frame.to(device, non_blocking=True)
+            with torch.amp.autocast(**autocast_kw):
+                z = enc(state)
+                raw = dec(z)
+                loss = oracle_decoder_loss(raw, frame, "cat-kmeans-unique", K=K, palette=palette_t)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step(); sched.step()
+            total += loss.item(); n += 1
+        print(f"[{run_name}] oracle ep {epoch+1}/{oracle_epochs} loss={total/n:.4f} ({time.time()-ep_t0:.1f}s)", flush=True)
+
+    enc.eval(); dec.eval()
+    for p in enc.parameters(): p.requires_grad_(False)
+    for p in dec.parameters(): p.requires_grad_(False)
+
+    # Stage 2: train predictor on (z_t, a_t) -> z_{t+1} MSE in latent space
+    print(f"[{run_name}] stage 2: training predictor for {pred_epochs} epochs", flush=True)
+    predictor = make_predictor(predictor_kind, dim=dim).to(device)
+    action_embed = nn.Embedding(4, dim).to(device)
+    opt2 = torch.optim.AdamW(list(predictor.parameters()) + list(action_embed.parameters()), lr=lr)
+    sched2 = torch.optim.lr_scheduler.CosineAnnealingLR(opt2, T_max=pred_epochs * (valid_idx_t.numel() // batch + 1))
+
+    states_t = states_t.to(device)
+    actions_t = actions_t.to(device)
+    valid_idx_t = valid_idx_t.to(device)
+
+    # Pre-encode all states once (frozen oracle)
+    print(f"[{run_name}] pre-encoding all states ...", flush=True)
+    with torch.no_grad():
+        Z = []
+        bs = 1024
+        for i in range(0, states_t.size(0), bs):
+            with torch.amp.autocast(**autocast_kw):
+                z = enc(states_t[i:i + bs])
+            Z.append(z.float())
+        Z = torch.cat(Z, dim=0)
+    print(f"[{run_name}] Z shape: {tuple(Z.shape)}", flush=True)
+
+    for epoch in range(pred_epochs):
+        predictor.train()
+        action_embed.train()
+        ep_t0 = time.time()
+        # shuffle valid transitions
+        perm = torch.randperm(valid_idx_t.numel(), device=device)
+        total = 0.0; n = 0
+        for s in range(0, valid_idx_t.numel() - batch, batch):
+            idx = valid_idx_t[perm[s:s + batch]]
+            z_t = Z[idx]                                        # (B, dim)
+            a_t = action_embed(actions_t[idx])                   # (B, dim)
+
+            if predictor_kind == "transformer":
+                hist_idx = torch.stack([idx - h for h in range(history - 1, -1, -1)], dim=1).clamp(min=0)  # (B, H)
+                z_hist = Z[hist_idx]                              # (B, H, dim)
+                a_hist = action_embed(actions_t[hist_idx])
+                with torch.amp.autocast(**autocast_kw):
+                    pred = predictor.step(z_hist, a_hist)         # (B, dim)
+                target = Z[idx + 1].detach()
+                loss = F.mse_loss(pred, target)
+            elif predictor_kind == "rnn":
+                # one-step training: feed (z_t, a_t), reset hidden each batch element
+                with torch.amp.autocast(**autocast_kw):
+                    pred, _ = predictor(z_t, a_t)
+                target = Z[idx + 1].detach()
+                loss = F.mse_loss(pred, target)
+            elif predictor_kind == "multistep":
+                # roll predictor forward `multi_step` steps, sum losses
+                with torch.amp.autocast(**autocast_kw):
+                    z_hat = z_t
+                    loss = z_t.new_zeros(())
+                    for k in range(multi_step):
+                        next_idx = (idx + k + 1).clamp(max=Z.size(0) - 1)
+                        # mask out invalid (crossing episode boundary)
+                        in_ep = (idx + k + 1 < Z.size(0)) & (~torch.isin(idx + k, valid_idx_t.new_tensor(ep_ends)))
+                        a_k = action_embed(actions_t[(idx + k).clamp(max=actions_t.numel() - 1)])
+                        z_hat = predictor(z_hat, a_k)
+                        target_k = Z[next_idx].detach()
+                        loss = loss + F.mse_loss(z_hat[in_ep], target_k[in_ep]) if in_ep.any() else loss
+                    loss = loss / multi_step
+            else:  # mlp / residual
+                with torch.amp.autocast(**autocast_kw):
+                    pred = predictor(z_t, a_t)
+                target = Z[idx + 1].detach()
+                loss = F.mse_loss(pred, target)
+
+            opt2.zero_grad(set_to_none=True)
+            loss.backward()
+            opt2.step(); sched2.step()
+            total += loss.item(); n += 1
+        print(f"[{run_name}] predictor ep {epoch+1}/{pred_epochs} loss={total/n:.5f} ({time.time()-ep_t0:.1f}s)", flush=True)
+
+        # save checkpoint each epoch
+        run_dir = Path(CKPT_DIR, run_name)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        cfg = dict(
+            run_name=run_name, mode="predictor",
+            predictor_kind=predictor_kind, multi_step=multi_step, history=history,
+            dim=dim, K=K, out_channels=out_channels,
+            decoder_kind="convt", state_encoding="spatial",
+            state_shape=[4, 64, 64], deep_cnn=False,
+            num_episodes=num_episodes, batch=batch,
+        )
+        (run_dir / "config.json").write_text(json.dumps(cfg, indent=2))
+        torch.save({
+            "epoch": epoch + 1, "step": (epoch + 1) * n,
+            "encoder_state": enc.state_dict(),
+            "decoder_state": dec.state_dict(),
+            "predictor_state": predictor.state_dict(),
+            "action_embed_state": action_embed.state_dict(),
+            "palette": palette,
+            "cfg": cfg,
+            "predictor_loss": total / max(n, 1),
+        }, run_dir / "latest.pt")
+        torch.save({
+            "epoch": epoch + 1, "step": (epoch + 1) * n,
+            "encoder_state": enc.state_dict(),
+            "decoder_state": dec.state_dict(),
+            "predictor_state": predictor.state_dict(),
+            "action_embed_state": action_embed.state_dict(),
+            "palette": palette,
+            "cfg": cfg,
+        }, run_dir / f"epoch_{epoch+1:03d}.pt")
+        vol.commit()
+    print(f"[{run_name}] DONE", flush=True)
+
+
 # Pinpoint ablation: same loss + dim=16 latent, vary one axis
 PINPOINT_RUNS = [
     # (run_name, state_encoding, decoder_kind, freq_K, deep_cnn)
@@ -368,6 +598,16 @@ def _make_perpixel(dim, out_channels, img_size=64, hidden=256):
 
 @app.local_entrypoint()
 def main():
+    print(f"Spawning {len(PREDICTOR_RUNS)} parallel H100 jobs (frozen-oracle predictor ablation) ...")
+    for run_name, kind, multi_step, history in PREDICTOR_RUNS:
+        h = train_predictor.spawn(
+            run_name=run_name, predictor_kind=kind,
+            multi_step=multi_step, history=history,
+        )
+        print(f"  spawned {run_name} (kind={kind}): {h.object_id}")
+    print("All jobs spawned.")
+    return
+    # ---- legacy: pinpoint ablation entrypoint ----
     print(f"Spawning {len(PINPOINT_RUNS)} parallel H100 jobs (pinpoint ablation, dim={PINPOINT_DIM}) ...")
     for run_name, state_enc, dec_kind, freq_K, deep in PINPOINT_RUNS:
         # `freq_K` selects which sinusoidal encoding to use

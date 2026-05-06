@@ -223,6 +223,73 @@ class OracleEncoder(nn.Module):
         return self.net(state)
 
 
+# ----- Predictor variants (frozen-oracle world model) ----------------------------
+class MLPPredictor(nn.Module):
+    """Concat(z, action_emb) -> MLP -> z'. No history, no recurrence."""
+    def __init__(self, dim=16, hidden=256, residual=False):
+        super().__init__()
+        self.residual = residual
+        self.net = nn.Sequential(
+            nn.Linear(dim * 2, hidden), nn.GELU(),
+            nn.Linear(hidden, hidden), nn.GELU(),
+            nn.Linear(hidden, dim),
+        )
+
+    def forward(self, z, a):
+        out = self.net(torch.cat([z, a], dim=-1))
+        return z + out if self.residual else out
+
+    def step(self, z_hist, a_hist):
+        # z_hist, a_hist: (B, T, dim) — use last
+        return self.forward(z_hist[:, -1], a_hist[:, -1])
+
+
+class GRUPredictor(nn.Module):
+    """Stateful GRU on (z, a) — implicit unbounded history."""
+    def __init__(self, dim=16, hidden=64):
+        super().__init__()
+        self.gru = nn.GRUCell(input_size=dim * 2, hidden_size=hidden)
+        self.head = nn.Linear(hidden, dim)
+        self.hidden_size = hidden
+
+    def forward(self, z, a, h=None):
+        if h is None:
+            h = z.new_zeros(z.size(0), self.hidden_size)
+        h_new = self.gru(torch.cat([z, a], dim=-1), h)
+        return self.head(h_new), h_new
+
+
+class TransformerPredictor(nn.Module):
+    """Causal AdaLN-zero transformer over (z, a) history."""
+    def __init__(self, dim=16, depth=4, heads=4, dim_head=4, mlp_dim=64, max_frames=8):
+        super().__init__()
+        self.pos = nn.Parameter(torch.randn(1, max_frames, dim) * 0.02)
+        self.blocks = nn.ModuleList([
+            ConditionalBlock(dim, heads, dim_head, mlp_dim, dropout=0.0) for _ in range(depth)
+        ])
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self, z_hist, a_hist):
+        # z_hist, a_hist: (B, T, dim)
+        T = z_hist.size(1)
+        x = z_hist + self.pos[:, :T]
+        for blk in self.blocks:
+            x = blk(x, a_hist)
+        return self.norm(x)
+
+    def step(self, z_hist, a_hist):
+        return self.forward(z_hist, a_hist)[:, -1]
+
+
+def make_predictor(kind: str, dim: int = 16):
+    if kind == "mlp":         return MLPPredictor(dim=dim, residual=False)
+    if kind == "residual":    return MLPPredictor(dim=dim, residual=True)
+    if kind == "multistep":   return MLPPredictor(dim=dim, residual=False)
+    if kind == "transformer": return TransformerPredictor(dim=dim)
+    if kind == "rnn":         return GRUPredictor(dim=dim, hidden=64)
+    raise ValueError(kind)
+
+
 class OracleEncoderCNN(nn.Module):
     """CNN encoder: spatial state mask (C, 64, 64) -> latent."""
     def __init__(self, in_channels: int = 4, out_dim: int = 128, deep: bool = False):

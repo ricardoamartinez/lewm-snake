@@ -146,6 +146,7 @@ def run_predictor_play(args, ckpt_path):
     from snake import Snake, state_features_v2
     from model import OracleEncoderCNN, TinyDecoder, make_predictor, render_oracle_output
 
+    from model import make_quantizer
     blob = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg = blob["cfg"]
     dim = cfg["dim"]
@@ -158,6 +159,10 @@ def run_predictor_play(args, ckpt_path):
     pred.load_state_dict(blob["predictor_state"]); pred.eval()
     act_embed = nn.Embedding(4, dim)
     act_embed.load_state_dict(blob["action_embed_state"]); act_embed.eval()
+    quantizer = make_quantizer(cfg.get("quantizer_kind", "none"), dim=dim)
+    if quantizer is not None and "quantizer_state" in blob:
+        quantizer.load_state_dict(blob["quantizer_state"]); quantizer.eval()
+        quantizer = quantizer.to(args.device)
     palette = blob["palette"]
     if not isinstance(palette, torch.Tensor):
         palette = torch.tensor(palette)
@@ -189,6 +194,9 @@ def run_predictor_play(args, ckpt_path):
         s = state_features_v2(env, encoding="spatial")
         with torch.no_grad():
             z0 = enc(torch.from_numpy(s).unsqueeze(0).to(args.device))         # (1, dim)
+            if quantizer is not None:
+                out = quantizer(z0)
+                z0 = out[0] if isinstance(out, tuple) else out
         z_hist = z0.unsqueeze(1)                                                # (1, 1, dim)
         a_hist = torch.zeros(1, 1, dim, device=args.device)
         h_state = None
@@ -250,6 +258,9 @@ def run_predictor_play(args, ckpt_path):
                 z_next, h_state = pred(z_hist[:, -1], a_t, h_state)
             else:
                 z_next = pred(z_hist[:, -1], a_t)
+            if quantizer is not None:
+                out = quantizer(z_next)
+                z_next = out[0] if isinstance(out, tuple) else out
             z_hist = torch.cat([z_hist, z_next.unsqueeze(1)], dim=1)
             raw = dec(z_next)
             recon = render_oracle_output(raw, "cat-kmeans-unique", K=K, palette=palette).clamp(0, 1)[0]

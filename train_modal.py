@@ -78,6 +78,32 @@ PREDICTOR_RUNS = [
 ]
 
 
+# Manifold-drift fix ablation: 20 ways to make predictor outputs renderable
+MANIFOLD_FIX_RUNS = [
+    # name,                  predictor,     quantizer,   joint, oracle_ep, pred_ep, pred_loss,    multi_step, decoder_noise
+    ("c-mlp-baseline",       "mlp",         "none",      False, 10, 15, "mse",        1, 0.0),
+    ("c-residual",           "residual",    "none",      False, 10, 15, "mse",        1, 0.0),
+    ("c-transformer",        "transformer", "none",      False, 10, 15, "mse",        1, 0.0),
+    ("c-multistep",          "mlp",         "none",      False, 10, 15, "mse",        4, 0.0),
+    ("c-rnn",                "rnn",         "none",      False, 10, 15, "mse",        1, 0.0),
+    ("fsq-8d5l-mlp",         "mlp",         "fsq8x5",    False, 10, 15, "mse",        1, 0.0),
+    ("fsq-16d4l-mlp",        "mlp",         "fsq16x4",   False, 10, 15, "mse",        1, 0.0),
+    ("fsq-4d8l-mlp",         "mlp",         "fsq4x8",    False, 10, 15, "mse",        1, 0.0),
+    ("vq-K512-mlp",          "mlp",         "vq-K512",   False, 10, 15, "mse",        1, 0.0),
+    ("vq-K1024-mlp",         "mlp",         "vq-K1024",  False, 10, 15, "mse",        1, 0.0),
+    ("joint-mlp",            "mlp",         "none",      True,  10, 15, "mse",        1, 0.0),
+    ("joint-residual",       "residual",    "none",      True,  10, 15, "mse",        1, 0.0),
+    ("joint-multistep",      "mlp",         "none",      True,  10, 15, "mse",        4, 0.0),
+    ("joint-fsq",            "mlp",         "fsq8x5",    True,  10, 15, "mse",        1, 0.0),
+    ("joint-vq",             "mlp",         "vq-K512",   True,  10, 15, "mse",        1, 0.0),
+    ("dist-noise-0.1",       "mlp",         "none",      False, 10, 15, "mse",        1, 0.1),
+    ("dist-noise-0.3",       "mlp",         "none",      False, 10, 15, "mse",        1, 0.3),
+    ("long-train",           "mlp",         "none",      False, 30, 30, "mse",        1, 0.0),
+    ("rollout-train",        "mlp",         "none",      False, 10, 15, "rollout",    8, 0.0),
+    ("rollout-fsq",          "mlp",         "fsq8x5",    False, 10, 15, "rollout",    8, 0.0),
+]
+
+
 @app.function(
     image=image,
     gpu="H100",
@@ -596,8 +622,322 @@ def _make_perpixel(dim, out_channels, img_size=64, hidden=256):
     return PerPixelDec()
 
 
+@app.function(
+    image=image,
+    gpu="H100",
+    volumes={CKPT_DIR: vol},
+    timeout=60 * 60,
+)
+def train_manifold(
+    run_name: str,
+    predictor_kind: str,
+    quantizer_kind: str,
+    joint: bool,
+    oracle_epochs: int,
+    pred_epochs: int,
+    pred_loss_kind: str,
+    multi_step: int,
+    decoder_noise: float,
+    history: int = 1,
+    batch: int = 256,
+    lr: float = 1e-3,
+    num_episodes: int = 1500,
+    dim: int = 16,
+    seed: int = 0,
+):
+    import json
+    import numpy as np
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    from torch.utils.data import Dataset, DataLoader
+
+    from snake import generate_oracle_dataset
+    from model import (
+        OracleEncoderCNN, TinyDecoder, kmeans_palette_unique,
+        oracle_decoder_loss, oracle_decoder_out_channels, make_predictor, make_quantizer,
+    )
+
+    torch.set_float32_matmul_precision("high")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    use_bf16 = device == "cuda"
+    autocast_kw = dict(device_type="cuda", dtype=torch.bfloat16) if use_bf16 else dict(device_type="cpu", enabled=False)
+    K_PALETTE = 8
+    out_channels = oracle_decoder_out_channels("cat-kmeans-unique", K=K_PALETTE)
+
+    # Adjust dim for FSQ flavors that imply different latent shapes
+    if quantizer_kind == "fsq16x4":
+        dim = 16
+    elif quantizer_kind == "fsq4x8":
+        dim = 4
+    elif quantizer_kind == "fsq8x5":
+        dim = 8
+
+    print(f"[{run_name}] pred={predictor_kind} quant={quantizer_kind} joint={joint} "
+          f"oracle_ep={oracle_epochs} pred_ep={pred_epochs} pred_loss={pred_loss_kind} "
+          f"multi_step={multi_step} dec_noise={decoder_noise} dim={dim}", flush=True)
+
+    print(f"[{run_name}] generating {num_episodes} episodes (spatial state) ...", flush=True)
+    t0 = time.time()
+    frames_list, states_list, actions_list = generate_oracle_dataset(
+        num_episodes, seed=seed, encoding="spatial", return_actions=True,
+    )
+    print(f"[{run_name}] dataset built in {time.time()-t0:.1f}s", flush=True)
+
+    # K-means palette
+    sample_pix = torch.from_numpy(np.stack([f for fr in frames_list[:200] for f in fr])).float().permute(0, 3, 1, 2) / 255.0
+    palette = kmeans_palette_unique(sample_pix.to(device).reshape(-1, 3), K=K_PALETTE).cpu()
+    palette_t = palette.to(device)
+
+    # Build models
+    enc = OracleEncoderCNN(in_channels=4, out_dim=dim).to(device)
+    dec = TinyDecoder(dim=dim, ch=128, out_channels=out_channels).to(device)
+    quantizer = make_quantizer(quantizer_kind, dim=dim)
+    if quantizer is not None:
+        quantizer = quantizer.to(device)
+
+    # Stack everything into tensors
+    all_frames = []
+    all_states = []
+    all_actions = []
+    ep_starts = [0]
+    for f, s, a in zip(frames_list, states_list, actions_list):
+        n = min(len(f), len(s), len(a) + 1)
+        all_frames.append(f[:n])
+        all_states.append(s[:n])
+        # last frame has no outgoing action; use placeholder
+        all_actions.append(np.concatenate([a[:n - 1], np.array([0], dtype=np.int64)]))
+        ep_starts.append(ep_starts[-1] + n)
+    frames_t = torch.from_numpy(np.concatenate(all_frames, axis=0)).float().permute(0, 3, 1, 2) / 255.0
+    states_t = torch.from_numpy(np.concatenate(all_states, axis=0))
+    actions_t = torch.from_numpy(np.concatenate(all_actions, axis=0))
+    ep_ends = np.array(ep_starts[1:]) - 1
+    valid_transition = np.ones(len(states_t), dtype=bool)
+    valid_transition[ep_ends] = False
+    valid_idx_t = torch.from_numpy(np.where(valid_transition)[0]).long().to(device)
+
+    states_t = states_t.to(device)
+    actions_t = actions_t.to(device)
+
+    print(f"[{run_name}] N frames {frames_t.size(0)}, N transitions {valid_idx_t.size(0)}", flush=True)
+
+    # Stage 1 — train oracle encoder + decoder (with optional noise injection in latent)
+    class FrameSet(Dataset):
+        def __len__(self): return frames_t.size(0)
+        def __getitem__(self, i): return states_t[i], frames_t[i]
+    loader = DataLoader(FrameSet(), batch_size=batch, shuffle=True, num_workers=2, drop_last=True, pin_memory=True, persistent_workers=True)
+    opt1 = torch.optim.AdamW(list(enc.parameters()) + list(dec.parameters())
+                             + (list(quantizer.parameters()) if quantizer is not None else []), lr=lr)
+    sched1 = torch.optim.lr_scheduler.CosineAnnealingLR(opt1, T_max=oracle_epochs * len(loader))
+    print(f"[{run_name}] stage 1: oracle for {oracle_epochs} epochs ...", flush=True)
+    for epoch in range(oracle_epochs):
+        enc.train(); dec.train()
+        if quantizer is not None: quantizer.train()
+        ep_t0 = time.time()
+        total = 0.0; n = 0
+        for state, frame in loader:
+            state = state.to(device, non_blocking=True)
+            frame = frame.to(device, non_blocking=True)
+            with torch.amp.autocast(**autocast_kw):
+                z = enc(state)
+                if quantizer is not None:
+                    out = quantizer(z)
+                    if isinstance(out, tuple):
+                        z, commit_loss, _ = out
+                    else:
+                        z, commit_loss = out, 0.0
+                else:
+                    commit_loss = 0.0
+                if decoder_noise > 0:
+                    z = z + decoder_noise * torch.randn_like(z)
+                raw = dec(z)
+                pixel_loss = oracle_decoder_loss(raw, frame, "cat-kmeans-unique", K=K_PALETTE, palette=palette_t)
+                loss = pixel_loss + (commit_loss if isinstance(commit_loss, torch.Tensor) else 0.0)
+            opt1.zero_grad(set_to_none=True)
+            loss.backward()
+            opt1.step(); sched1.step()
+            total += loss.item(); n += 1
+        print(f"[{run_name}] oracle ep {epoch+1}/{oracle_epochs} loss={total/n:.4f} ({time.time()-ep_t0:.1f}s)", flush=True)
+
+    if not joint:
+        for p in enc.parameters(): p.requires_grad_(False)
+        for p in dec.parameters(): p.requires_grad_(False)
+        if quantizer is not None:
+            for p in quantizer.parameters(): p.requires_grad_(False)
+        enc.eval(); dec.eval()
+        if quantizer is not None: quantizer.eval()
+
+    # Pre-encode all states under current oracle (stale during joint training but OK)
+    print(f"[{run_name}] encoding all states ...", flush=True)
+    Z_list = []
+    with torch.no_grad():
+        bs = 1024
+        for i in range(0, states_t.size(0), bs):
+            with torch.amp.autocast(**autocast_kw):
+                z = enc(states_t[i:i + bs])
+                if quantizer is not None:
+                    out = quantizer(z)
+                    z = out[0] if isinstance(out, tuple) else out
+            Z_list.append(z.float())
+        Z = torch.cat(Z_list, dim=0)
+
+    predictor = make_predictor(predictor_kind, dim=dim).to(device)
+    action_embed = nn.Embedding(4, dim).to(device)
+    pred_params = list(predictor.parameters()) + list(action_embed.parameters())
+    if joint:
+        pred_params = pred_params + list(enc.parameters()) + list(dec.parameters())
+        if quantizer is not None:
+            pred_params = pred_params + list(quantizer.parameters())
+    opt2 = torch.optim.AdamW(pred_params, lr=lr)
+    sched2 = torch.optim.lr_scheduler.CosineAnnealingLR(opt2, T_max=pred_epochs * (valid_idx_t.numel() // batch + 1))
+
+    print(f"[{run_name}] stage 2: predictor for {pred_epochs} epochs ...", flush=True)
+    for epoch in range(pred_epochs):
+        predictor.train(); action_embed.train()
+        if joint:
+            enc.train(); dec.train()
+            if quantizer is not None: quantizer.train()
+        ep_t0 = time.time()
+        perm = torch.randperm(valid_idx_t.numel(), device=device)
+        total = 0.0; n = 0
+
+        # If joint, refresh Z each epoch
+        if joint and epoch > 0:
+            Z_list = []
+            with torch.no_grad():
+                for i in range(0, states_t.size(0), 1024):
+                    with torch.amp.autocast(**autocast_kw):
+                        z = enc(states_t[i:i + 1024])
+                        if quantizer is not None:
+                            out = quantizer(z)
+                            z = out[0] if isinstance(out, tuple) else out
+                    Z_list.append(z.float())
+                Z = torch.cat(Z_list, dim=0)
+
+        for s in range(0, valid_idx_t.numel() - batch, batch):
+            idx = valid_idx_t[perm[s:s + batch]]
+            z_t = Z[idx]
+            a_t = action_embed(actions_t[idx])
+            target = Z[idx + 1].detach()
+
+            with torch.amp.autocast(**autocast_kw):
+                if pred_loss_kind == "rollout":
+                    # Multi-step free-rollout: feed predictor's own outputs back
+                    z_hat = z_t
+                    loss = z_t.new_zeros(())
+                    valid_mask = torch.ones(idx.size(0), dtype=torch.bool, device=device)
+                    for k in range(multi_step):
+                        a_k = action_embed(actions_t[(idx + k).clamp(max=actions_t.numel() - 1)])
+                        if predictor_kind == "transformer":
+                            z_hat = predictor.step(z_hat.unsqueeze(1), a_k.unsqueeze(1))
+                        elif predictor_kind == "rnn":
+                            z_hat, _ = predictor(z_hat, a_k)
+                        else:
+                            z_hat = predictor(z_hat, a_k)
+                        # mask out indices that have crossed an episode boundary
+                        next_idx = (idx + k + 1).clamp(max=Z.size(0) - 1)
+                        in_ep = (idx + k + 1 < Z.size(0)) & (~torch.isin(idx + k, torch.from_numpy(ep_ends).long().to(device)))
+                        valid_mask = valid_mask & in_ep
+                        target_k = Z[next_idx].detach()
+                        if valid_mask.any():
+                            loss = loss + F.mse_loss(z_hat[valid_mask], target_k[valid_mask])
+                    loss = loss / multi_step
+                elif multi_step > 1:
+                    # multi-step teacher-forcing: predict z_{t+1}, z_{t+2}, ..., z_{t+multi_step}
+                    z_hat = z_t
+                    loss = z_t.new_zeros(())
+                    for k in range(multi_step):
+                        a_k = action_embed(actions_t[(idx + k).clamp(max=actions_t.numel() - 1)])
+                        if predictor_kind == "transformer":
+                            z_hat = predictor.step(z_hat.unsqueeze(1), a_k.unsqueeze(1))
+                        elif predictor_kind == "rnn":
+                            z_hat, _ = predictor(z_hat, a_k)
+                        else:
+                            z_hat = predictor(z_hat, a_k)
+                        next_idx = (idx + k + 1).clamp(max=Z.size(0) - 1)
+                        in_ep = (idx + k + 1 < Z.size(0))
+                        target_k = Z[next_idx].detach()
+                        if in_ep.any():
+                            loss = loss + F.mse_loss(z_hat[in_ep], target_k[in_ep])
+                    loss = loss / multi_step
+                else:
+                    if predictor_kind == "transformer":
+                        pred = predictor.step(z_t.unsqueeze(1), a_t.unsqueeze(1))
+                    elif predictor_kind == "rnn":
+                        pred, _ = predictor(z_t, a_t)
+                    else:
+                        pred = predictor(z_t, a_t)
+                    loss = F.mse_loss(pred, target)
+
+                if joint:
+                    # ALSO add an oracle pixel loss on the current batch's frames
+                    with torch.amp.autocast(**autocast_kw):
+                        z_recon = enc(states_t[idx])
+                        if quantizer is not None:
+                            out = quantizer(z_recon)
+                            z_recon = out[0] if isinstance(out, tuple) else out
+                        raw_recon = dec(z_recon)
+                        pixel_loss = oracle_decoder_loss(raw_recon, frames_t[idx].to(device),
+                                                          "cat-kmeans-unique", K=K_PALETTE, palette=palette_t)
+                    loss = loss + pixel_loss
+
+            opt2.zero_grad(set_to_none=True)
+            loss.backward()
+            opt2.step(); sched2.step()
+            total += loss.item(); n += 1
+
+        run_dir = Path(CKPT_DIR, run_name)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        cfg = dict(
+            run_name=run_name, mode="predictor",
+            predictor_kind=predictor_kind, quantizer_kind=quantizer_kind,
+            joint=joint, multi_step=multi_step, history=history,
+            dim=dim, K=K_PALETTE, out_channels=out_channels,
+            decoder_kind="convt", state_encoding="spatial",
+            state_shape=[4, 64, 64], deep_cnn=False,
+            num_episodes=num_episodes, batch=batch,
+            pred_loss_kind=pred_loss_kind, decoder_noise=decoder_noise,
+        )
+        (run_dir / "config.json").write_text(json.dumps(cfg, indent=2))
+        payload = {
+            "epoch": epoch + 1, "step": (epoch + 1) * n,
+            "encoder_state": enc.state_dict(),
+            "decoder_state": dec.state_dict(),
+            "predictor_state": predictor.state_dict(),
+            "action_embed_state": action_embed.state_dict(),
+            "palette": palette,
+            "cfg": cfg,
+        }
+        if quantizer is not None:
+            payload["quantizer_state"] = quantizer.state_dict()
+        torch.save(payload, run_dir / "latest.pt")
+        torch.save(payload, run_dir / f"epoch_{epoch+1:03d}.pt")
+        vol.commit()
+        print(f"[{run_name}] predictor ep {epoch+1}/{pred_epochs} loss={total/n:.5f} ({time.time()-ep_t0:.1f}s)", flush=True)
+
+    print(f"[{run_name}] DONE", flush=True)
+
+
 @app.local_entrypoint()
 def main():
+    print(f"Spawning {len(MANIFOLD_FIX_RUNS)} parallel H100 jobs (manifold-drift fixes) ...")
+    for cfg in MANIFOLD_FIX_RUNS:
+        name, pred, quant, joint, oep, pep, ploss, mstep, dnoise = cfg
+        h = train_manifold.spawn(
+            run_name=name,
+            predictor_kind=pred,
+            quantizer_kind=quant,
+            joint=joint,
+            oracle_epochs=oep,
+            pred_epochs=pep,
+            pred_loss_kind=ploss,
+            multi_step=mstep,
+            decoder_noise=dnoise,
+        )
+        print(f"  spawned {name}: {h.object_id}")
+    print("All jobs spawned.")
+    return
+    # legacy entrypoint below
     print(f"Spawning {len(PREDICTOR_RUNS)} parallel H100 jobs (frozen-oracle predictor ablation) ...")
     for run_name, kind, multi_step, history in PREDICTOR_RUNS:
         h = train_predictor.spawn(

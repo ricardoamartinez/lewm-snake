@@ -223,6 +223,77 @@ class OracleEncoder(nn.Module):
         return self.net(state)
 
 
+# ----- Quantization layers ------------------------------------------------------
+class FSQ(nn.Module):
+    """Finite Scalar Quantization: per-dim round-to-grid with straight-through.
+    Each of `dim` latent dims is rounded to one of `levels` evenly spaced points
+    in [-1, 1]. No learnable codebook → no codebook collapse."""
+    def __init__(self, dim: int, levels: int = 5):
+        super().__init__()
+        self.dim = dim
+        self.levels = levels
+
+    def forward(self, z):
+        # bound z to [-1, 1] via tanh, then quantize per-dim to `levels` levels
+        z = z.tanh()
+        L = self.levels
+        scale = (L - 1) / 2.0
+        zq = (z * scale).round() / scale
+        # Straight-through estimator
+        return z + (zq - z).detach()
+
+
+class VQ(nn.Module):
+    """VQ-VAE single codebook (EMA), straight-through estimator + commitment loss.
+    Holds a codebook of K codes in `dim` dims. Forward returns (z_q, commitment_loss)."""
+    def __init__(self, dim: int, K: int = 512, decay: float = 0.99, commit_weight: float = 0.25):
+        super().__init__()
+        self.dim = dim
+        self.K = K
+        self.decay = decay
+        self.commit_weight = commit_weight
+        self.register_buffer("codebook", torch.randn(K, dim) * 0.1)
+        self.register_buffer("ema_count", torch.ones(K))
+        self.register_buffer("ema_sum", self.codebook.clone())
+
+    def forward(self, z):
+        # z: (B, dim)
+        flat = z.reshape(-1, self.dim)                                # (N, dim)
+        d2 = (flat.pow(2).sum(dim=1, keepdim=True)
+              - 2 * flat @ self.codebook.t()
+              + self.codebook.pow(2).sum(dim=1, keepdim=True).t())
+        idx = d2.argmin(dim=1)                                         # (N,)
+        z_q = self.codebook[idx].view_as(z)
+        # EMA update (only in training)
+        if self.training:
+            with torch.no_grad():
+                onehot = F.one_hot(idx, self.K).type_as(self.codebook)  # (N, K)
+                cnt = onehot.sum(dim=0)                                  # (K,)
+                self.ema_count.mul_(self.decay).add_(cnt, alpha=1 - self.decay)
+                self.ema_sum.mul_(self.decay).add_(onehot.t() @ flat, alpha=1 - self.decay)
+                n = self.ema_count.sum()
+                self.codebook.copy_((self.ema_sum / (self.ema_count + 1e-5).unsqueeze(1)))
+        commit_loss = F.mse_loss(flat, z_q.detach().view_as(flat))
+        z_q_st = z + (z_q - z).detach()
+        return z_q_st, self.commit_weight * commit_loss, idx
+
+
+def make_quantizer(kind: str, dim: int):
+    if kind == "none":
+        return None
+    if kind == "fsq8x5":
+        return FSQ(dim=dim, levels=5)         # implies dim must be 8 ideally
+    if kind == "fsq16x4":
+        return FSQ(dim=dim, levels=4)
+    if kind == "fsq4x8":
+        return FSQ(dim=dim, levels=8)
+    if kind == "vq-K512":
+        return VQ(dim=dim, K=512)
+    if kind == "vq-K1024":
+        return VQ(dim=dim, K=1024)
+    raise ValueError(kind)
+
+
 # ----- Predictor variants (frozen-oracle world model) ----------------------------
 class MLPPredictor(nn.Module):
     """Concat(z, action_emb) -> MLP -> z'. No history, no recurrence."""

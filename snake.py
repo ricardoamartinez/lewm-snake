@@ -46,10 +46,8 @@ class Snake:
             self.dir = action
         dy, dx = DIRS[self.dir]
         head = self.body[0]
-        new_head = (head[0] + dy, head[1] + dx)
-        if not (0 <= new_head[0] < GRID and 0 <= new_head[1] < GRID):
-            self.done = True
-            return self.render(), True
+        # Toroidal: wrap around edges instead of dying on walls.
+        new_head = ((head[0] + dy) % GRID, (head[1] + dx) % GRID)
         if new_head in self.body[:-1]:
             self.done = True
             return self.render(), True
@@ -94,8 +92,8 @@ def heuristic_action(env):
         if a == OPPOSITE[env.dir]:
             continue
         dy, dx = DIRS[a]
-        nh = (head[0] + dy, head[1] + dx)
-        if 0 <= nh[0] < GRID and 0 <= nh[1] < GRID and nh not in body_set:
+        nh = ((head[0] + dy) % GRID, (head[1] + dx) % GRID)
+        if nh not in body_set:
             return a
     return env.dir
 

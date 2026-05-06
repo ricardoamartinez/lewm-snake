@@ -290,12 +290,32 @@ class SpatialVQ(nn.Module):
         self.vq = VQ(dim=dim, K=K)
 
     def forward(self, z):
-        # z: (B, dim, H, W) -> (B, dim, H, W) (quantized)
+        # z: (B, dim, H, W) -> (B, dim, H, W) (quantized).
+        # Disable autocast — bf16 makes VQ EMA + distance computation NaN.
         in_dtype = z.dtype
         z_perm = z.permute(0, 2, 3, 1).contiguous().float()                # (B, H, W, dim) fp32
-        z_q, commit, _idx = self.vq(z_perm)
+        with torch.amp.autocast("cuda", enabled=False):
+            z_q, commit, _idx = self.vq(z_perm)
         z_q = z_q.permute(0, 3, 1, 2).contiguous().to(in_dtype)
         return z_q, commit.to(in_dtype)
+
+
+class SpatialFSQ(nn.Module):
+    """FSQ on spatial latent: bound z via tanh, round each dim to one of L levels.
+    Total codes per cell = L^dim. No codebook to learn (no EMA, no NaN).
+    Forces commitment without VQ instability.
+    """
+    def __init__(self, dim: int, levels: int = 5):
+        super().__init__()
+        self.fsq = FSQ(dim=dim, levels=levels)
+
+    def forward(self, z):
+        in_dtype = z.dtype
+        z_perm = z.permute(0, 2, 3, 1).contiguous().float()
+        with torch.amp.autocast("cuda", enabled=False):
+            z_q = self.fsq(z_perm)
+        z_q = z_q.permute(0, 3, 1, 2).contiguous().to(in_dtype)
+        return z_q, z.new_zeros(())                                         # no commit loss
 
 
 def make_quantizer(kind: str, dim: int):

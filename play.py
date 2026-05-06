@@ -148,7 +148,7 @@ def run_arch_jepa_play(args, ckpt_path):
     from model import (
         OracleEncoderCNN, TinyDecoder, SpatialEncoder, SpatialDecoder, SpatialPixShufDecoder,
         ConvPredictor, StochasticConvPredictor, GlobalConvPredictor, AttnPredictor,
-        SpatialVQ, make_predictor, render_oracle_output,
+        SpatialVQ, SpatialFSQ, make_predictor, render_oracle_output,
     )
 
     blob = torch.load(ckpt_path, map_location="cpu", weights_only=False)
@@ -208,8 +208,14 @@ def run_arch_jepa_play(args, ckpt_path):
     act_embed.load_state_dict(blob["action_embed_state"]); act_embed.eval()
 
     vq_K = cfg.get("vq_K", 0)
+    fsq_levels = cfg.get("fsq_levels", 0)
     vq = None
-    if vq_K > 0 and "vq_state" in blob:
+    if fsq_levels > 0:
+        vq = SpatialFSQ(dim=dim, levels=fsq_levels)
+        if "vq_state" in blob:
+            vq.load_state_dict(blob["vq_state"])
+        vq.eval(); vq = vq.to(args.device)
+    elif vq_K > 0 and "vq_state" in blob:
         vq = SpatialVQ(dim=dim, K=vq_K)
         vq.load_state_dict(blob["vq_state"]); vq.eval()
         vq = vq.to(args.device)

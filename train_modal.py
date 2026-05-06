@@ -355,6 +355,7 @@ def train_arch_jepa(
     predictor_kind_override: str = "",  # "" = auto, "stoch-conv" = stochastic conv predictor
     steps_per_epoch_cap: int = 0,  # if > 0, sample only this many batches per epoch (fast iter)
     vq_K: int = 0,                  # if > 0, apply VQ with K codes between predictor and decoder
+    fsq_levels: int = 0,            # if > 0, apply FSQ with L levels per dim (more stable than VQ)
 ):
     """Full JEPA system with spatial latent: encoder + ConvPredictor + decoder.
     Trains on T-step windows with both pred MSE in latent space and dec CE in pixel space.
@@ -370,7 +371,7 @@ def train_arch_jepa(
     from model import (
         OracleEncoderCNN, TinyDecoder, SpatialEncoder, SpatialDecoder, SpatialPixShufDecoder,
         MLPPredictor, ConvPredictor, StochasticConvPredictor, GlobalConvPredictor, AttnPredictor,
-        SpatialVQ, make_predictor,
+        SpatialVQ, SpatialFSQ, make_predictor,
         kmeans_palette_unique, oracle_decoder_loss, oracle_decoder_out_channels,
     )
 
@@ -474,7 +475,12 @@ def train_arch_jepa(
     pred_kind = effective_pred_kind
     action_embed = nn.Embedding(4, dim).to(device)
 
-    vq = SpatialVQ(dim=dim, K=vq_K).to(device) if vq_K > 0 else None
+    if fsq_levels > 0:
+        vq = SpatialFSQ(dim=dim, levels=fsq_levels).to(device)
+    elif vq_K > 0:
+        vq = SpatialVQ(dim=dim, K=vq_K).to(device)
+    else:
+        vq = None
 
     params = (list(enc.parameters()) + list(pred.parameters())
               + list(dec.parameters()) + list(action_embed.parameters()))
@@ -498,7 +504,7 @@ def train_arch_jepa(
         latent_noise=latent_noise, dec_kind=dec_kind, entropy_lambda=entropy_lambda,
         hard_mining=hard_mining, prio_alpha=prio_alpha,
         pred_blocks=pred_blocks, pred_hidden=pred_hidden,
-        vq_K=vq_K,
+        vq_K=vq_K, fsq_levels=fsq_levels,
     )
     (run_dir / "config.json").write_text(json.dumps(cfg, indent=2))
 
@@ -648,12 +654,12 @@ def train_arch_jepa(
 # predictor's continuous output is snapped to ONE of K codes per cell.
 # Different K and combos to find sweet spot.
 ARCH_RUNS = [
-    # (run_name,            arch_kind,    dec_kind,  ent,  pred_override,        pb, ph,  vq_K)
-    ("commit-control",      "spatial-32", "pixshuf", 0.3,  "stoch-conv",          2, 64,  0),
-    ("commit-vq128",        "spatial-32", "pixshuf", 0.3,  "stoch-conv",          2, 64,  128),
-    ("commit-vq512",        "spatial-32", "pixshuf", 0.3,  "stoch-conv",          2, 64,  512),
-    ("commit-vq2048",       "spatial-32", "pixshuf", 0.3,  "stoch-conv",          2, 64,  2048),
-    ("commit-vq512-deep",   "spatial-32", "pixshuf", 0.3,  "stoch-conv",          6, 128, 512),
+    # (run_name,            arch_kind,    dec_kind,  ent,  pred_override,       pb, ph,  fsq_L)
+    ("commit2-control",     "spatial-32", "pixshuf", 0.3,  "stoch-conv",         2, 64,  0),
+    ("commit2-fsq3",        "spatial-32", "pixshuf", 0.3,  "stoch-conv",         2, 64,  3),   # 3^16=43M codes/cell
+    ("commit2-fsq5",        "spatial-32", "pixshuf", 0.3,  "stoch-conv",         2, 64,  5),   # 5^16=152B codes/cell
+    ("commit2-fsq8",        "spatial-32", "pixshuf", 0.3,  "stoch-conv",         2, 64,  8),
+    ("commit2-fsq5-deep",   "spatial-32", "pixshuf", 0.3,  "stoch-conv",         6, 128, 5),
 ]
 
 
@@ -1501,8 +1507,8 @@ def train_manifold(
 
 @app.local_entrypoint()
 def main():
-    print(f"Spawning {len(ARCH_RUNS)} parallel H100 jobs (commit: VQ discrete latent) ...")
-    for run_name, arch_kind, dec_kind, ent, pred_override, pb, phid, vq_K in ARCH_RUNS:
+    print(f"Spawning {len(ARCH_RUNS)} parallel H100 jobs (commit: FSQ discrete latent) ...")
+    for run_name, arch_kind, dec_kind, ent, pred_override, pb, phid, fsq_L in ARCH_RUNS:
         bs = 32 if arch_kind.startswith("spatial-64") else 64
         h = train_arch_jepa.spawn(
             run_name=run_name, arch_kind=arch_kind,
@@ -1515,9 +1521,9 @@ def main():
             dec_kind=dec_kind, entropy_lambda=ent,
             predictor_kind_override=pred_override,
             pred_blocks=pb, pred_hidden=phid,
-            vq_K=vq_K,
+            fsq_levels=fsq_L,
         )
-        print(f"  spawned {run_name} (pred={pred_override}, blocks={pb}x{phid}, vq_K={vq_K}): {h.object_id}")
+        print(f"  spawned {run_name} (pred={pred_override}, blocks={pb}x{phid}, fsq_L={fsq_L}): {h.object_id}")
     print("All jobs spawned.")
     return
     # legacy entrypoint below

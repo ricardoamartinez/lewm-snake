@@ -345,6 +345,9 @@ def train_arch_jepa(
     dec_lambda: float = 1.0,
     rollout_dec: bool = True,   # if True, decoder loss is on PREDICTED latents (option B);
                                  # if False, on encoded latents (option A — manifold-locked)
+    latent_noise: float = 0.0,  # noise added to predicted latents during rollout (drift robustness)
+    pred_blocks: int = 2,       # depth of ConvPredictor
+    pred_hidden: int = 64,      # width of ConvPredictor
 ):
     """Full JEPA system with spatial latent: encoder + ConvPredictor + decoder.
     Trains on T-step windows with both pred MSE in latent space and dec CE in pixel space.
@@ -425,7 +428,10 @@ def train_arch_jepa(
     else:
         raise ValueError(arch_kind)
 
-    pred = make_predictor(pred_kind, dim=dim).to(device)
+    if pred_kind == "conv":
+        pred = ConvPredictor(dim=dim, hidden=pred_hidden, n_blocks=pred_blocks).to(device)
+    else:
+        pred = make_predictor(pred_kind, dim=dim).to(device)
     action_embed = nn.Embedding(4, dim).to(device)
 
     params = (list(enc.parameters()) + list(pred.parameters())
@@ -466,13 +472,12 @@ def train_arch_jepa(
                     emb = emb.view(B, T_, dim)
                 act_emb = action_embed(a)                    # (B, T-1, dim)
 
-                # Rollout: z_hat[0] = emb[0], then predictor
+                # Rollout: z_hat[0] = emb[0], then predictor (optionally with drift noise)
                 z_hat = [emb[:, 0]]
                 for t in range(T_ - 1):
-                    if is_spatial:
-                        z_next = pred(z_hat[-1], act_emb[:, t])
-                    else:
-                        z_next = pred(z_hat[-1], act_emb[:, t])
+                    z_next = pred(z_hat[-1], act_emb[:, t])
+                    if latent_noise > 0:
+                        z_next = z_next + latent_noise * torch.randn_like(z_next)
                     z_hat.append(z_next)
                 z_hat_stack = torch.stack(z_hat, dim=1)      # (B, T, dim, [H_lat, W_lat])
 
@@ -521,15 +526,15 @@ def train_arch_jepa(
     print(f"[{run_name}] DONE in {time.time()-train_t0:.0f}s", flush=True)
 
 
-# Precision ablation v3 — H100 (80 GB) so we can do spatial-64 (pixel-perfect)
-# and bigCh variants. All pred_lambda=0, rollout dec_loss only.
+# Manifold-drift ablation: prec3 collapsed at step ~20 because training rollout was only T=8.
+# Fix: extend rollout to pred_horizon=32 + experiment with latent noise + bigger predictor.
 ARCH_RUNS = [
-    # (run_name,                       arch_kind)
-    ("prec3-spatial-32",               "spatial-32"),
-    ("prec3-spatial-64",               "spatial-64"),               # 1 px per cell
-    ("prec3-spatial-32-deep",          "spatial-32-deep"),
-    ("prec3-spatial-64-deep",          "spatial-64-deep"),
-    ("prec3-spatial-32-deep-bigCh",    "spatial-32-deep-bigCh"),
+    # (run_name,                  arch_kind,    pred_horizon, latent_noise, pred_blocks, pred_hidden, batch)
+    ("drift-h32-spatial-32",      "spatial-32",  32,           0.0,          2,           64,          64),
+    ("drift-h32-noise01",         "spatial-32",  32,           0.01,         2,           64,          64),
+    ("drift-h32-noise05",         "spatial-32",  32,           0.05,         2,           64,          64),
+    ("drift-h32-bigPred",         "spatial-32",  32,           0.0,          4,           128,         64),
+    ("drift-h32-spatial-64",      "spatial-64",  32,           0.0,          2,           64,          32),
 ]
 
 
@@ -1377,13 +1382,16 @@ def train_manifold(
 
 @app.local_entrypoint()
 def main():
-    print(f"Spawning {len(ARCH_RUNS)} parallel A10G jobs (precision: finer latents + deeper) ...")
-    for run_name, arch_kind in ARCH_RUNS:
+    print(f"Spawning {len(ARCH_RUNS)} parallel H100 jobs (manifold-drift fix: long rollout) ...")
+    for run_name, arch_kind, ph, ln, pb, phid, bs in ARCH_RUNS:
         h = train_arch_jepa.spawn(
             run_name=run_name, arch_kind=arch_kind,
             rollout_dec=True, pred_lambda=0.0,
+            history=1, pred_horizon=ph,
+            latent_noise=ln, pred_blocks=pb, pred_hidden=phid,
+            batch=bs,
         )
-        print(f"  spawned {run_name} ({arch_kind}): {h.object_id}")
+        print(f"  spawned {run_name} ({arch_kind}, ph={ph}, ln={ln}, pred={pb}x{phid}, bs={bs}): {h.object_id}")
     print("All jobs spawned.")
     return
     # legacy entrypoint below

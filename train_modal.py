@@ -354,7 +354,7 @@ def train_full(
     num_episodes: int = 1500,
     history: int = 4,
     pred_horizon: int = 4,
-    dim: int = 64,
+    dim: int = 16,
     seed: int = 0,
 ):
     import json

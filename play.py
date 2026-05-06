@@ -226,10 +226,12 @@ def run_arch_jepa_play(args, ckpt_path):
 
     pygame.init()
     cell = 64 * args.scale
-    screen = pygame.display.set_mode((cell * 2 + 8, cell + 40))
-    title = f"LeWM-Snake JEPA [{args.run}] ep={ep} arch={arch}"
+    # 3-pane layout: GT | AE | JEPA
+    screen = pygame.display.set_mode((cell * 3 + 16, cell + 60))
+    title = f"LeWM-Snake [{args.run}] ep={ep} arch={arch}"
     pygame.display.set_caption(title)
     font = pygame.font.SysFont("monospace", 14)
+    small_font = pygame.font.SysFont("monospace", 11)
     clock = pygame.time.Clock()
 
     KEY_TO_ACTION = {
@@ -238,8 +240,9 @@ def run_arch_jepa_play(args, ckpt_path):
     }
     NAMES = {0: "UP", 1: "DOWN", 2: "LEFT", 3: "RIGHT"}
 
+    grid_cells = cfg.get("grid_cells", 64)
     rng = np.random.default_rng(int(time.time()) & 0xFFFF)
-    env = Snake(seed=int(rng.integers(1 << 30)))
+    env = Snake(seed=int(rng.integers(1 << 30)), grid_cells=grid_cells)
 
     def reset_imag():
         with torch.no_grad():
@@ -272,39 +275,61 @@ def run_arch_jepa_play(args, ckpt_path):
                         env = Snake(seed=int(rng.integers(1 << 30)))
                         z = reset_imag(); step_idx = 0
                 elif event.key == pygame.K_n:
-                    env = Snake(seed=int(rng.integers(1 << 30)))
+                    env = Snake(seed=int(rng.integers(1 << 30)), grid_cells=grid_cells)
                     z = reset_imag(); step_idx = 0
                 elif event.key in KEY_TO_ACTION:
                     current_action = KEY_TO_ACTION[event.key]
 
         _, done = env.step(current_action)
         if done:
-            env = Snake(seed=int(rng.integers(1 << 30)))
+            env = Snake(seed=int(rng.integers(1 << 30)), grid_cells=grid_cells)
             z = reset_imag(); step_idx = 0
             continue
         real_frame = env.render()
+        real_t = torch.from_numpy(real_frame).float().permute(2, 0, 1).unsqueeze(0).to(args.device) / 255.0
 
         with torch.no_grad():
-            a_t = act_embed(torch.tensor([current_action], device=args.device))  # (1, dim)
-            z = pred(z, a_t)                                                       # roll latent
+            # AE: encode + decode current real frame (no rollout) — tests encoder/decoder fidelity
+            z_ae = enc(real_t)
             if vq is not None:
-                z, _ = vq(z)                                                       # snap to discrete code
-            raw = dec(z)
-            recon = render_oracle_output(raw, "cat-kmeans-unique", K=K, palette=palette).clamp(0, 1)[0]
+                z_ae_q, _ = vq(z_ae)
+            else:
+                z_ae_q = z_ae
+            raw_ae = dec(z_ae_q)
+            recon_ae = render_oracle_output(raw_ae, "cat-kmeans-unique", K=K, palette=palette).clamp(0, 1)[0]
+
+            # JEPA: roll predictor forward — tests dynamics
+            a_t = act_embed(torch.tensor([current_action], device=args.device))
+            z = pred(z, a_t)
+            if vq is not None:
+                z, _ = vq(z)
+            raw_jepa = dec(z)
+            recon_jepa = render_oracle_output(raw_jepa, "cat-kmeans-unique", K=K, palette=palette).clamp(0, 1)[0]
 
         screen.fill((0, 0, 0))
-        real_surf = pygame.surfarray.make_surface(real_frame.swapaxes(0, 1))
-        real_surf = pygame.transform.scale(real_surf, (cell, cell))
-        screen.blit(real_surf, (0, 0))
-        rec_arr = (recon.cpu().numpy().transpose(1, 2, 0) * 255).clip(0, 255).round().astype(np.uint8)
-        rec_surf = pygame.surfarray.make_surface(rec_arr.swapaxes(0, 1))
-        rec_surf = pygame.transform.scale(rec_surf, (cell, cell))
-        screen.blit(rec_surf, (cell + 8, 0))
+        # GT
+        gt_surf = pygame.surfarray.make_surface(real_frame.swapaxes(0, 1))
+        gt_surf = pygame.transform.scale(gt_surf, (cell, cell))
+        screen.blit(gt_surf, (0, 0))
+        # AE
+        ae_arr = (recon_ae.cpu().numpy().transpose(1, 2, 0) * 255).clip(0, 255).round().astype(np.uint8)
+        ae_surf = pygame.surfarray.make_surface(ae_arr.swapaxes(0, 1))
+        ae_surf = pygame.transform.scale(ae_surf, (cell, cell))
+        screen.blit(ae_surf, (cell + 8, 0))
+        # JEPA
+        je_arr = (recon_jepa.cpu().numpy().transpose(1, 2, 0) * 255).clip(0, 255).round().astype(np.uint8)
+        je_surf = pygame.surfarray.make_surface(je_arr.swapaxes(0, 1))
+        je_surf = pygame.transform.scale(je_surf, (cell, cell))
+        screen.blit(je_surf, (cell * 2 + 16, 0))
+        # Labels
+        screen.blit(small_font.render("GT", True, (180, 180, 180)), (cell // 2 - 8, cell + 4))
+        screen.blit(small_font.render("AE (enc+dec on GT)", True, (180, 180, 180)), (cell + 8 + cell // 2 - 50, cell + 4))
+        screen.blit(small_font.render("JEPA (predictor rollout)", True, (180, 180, 180)), (cell * 2 + 16 + cell // 2 - 60, cell + 4))
         info = font.render(
-            f"ep={ep} arch={arch} step={step_idx} act={NAMES[current_action]} L=REAL R=IMAGINED(JEPA)",
+            f"ep={ep} arch={arch} grid={grid_cells} step={step_idx} act={NAMES[current_action]}",
             True, (200, 200, 200),
         )
-        screen.blit(info, (8, cell + 12))
+        screen.blit(info, (8, cell + 28))
         pygame.display.flip()
         clock.tick(args.fps)
         step_idx += 1

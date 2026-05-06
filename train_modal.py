@@ -356,6 +356,7 @@ def train_arch_jepa(
     steps_per_epoch_cap: int = 0,  # if > 0, sample only this many batches per epoch (fast iter)
     vq_K: int = 0,                  # if > 0, apply VQ with K codes between predictor and decoder
     fsq_levels: int = 0,            # if > 0, apply FSQ with L levels per dim (more stable than VQ)
+    grid_cells: int = 64,           # snake game grid (16 = chunky 4px cells, 64 = 1px cells)
 ):
     """Full JEPA system with spatial latent: encoder + ConvPredictor + decoder.
     Trains on T-step windows with both pred MSE in latent space and dec CE in pixel space.
@@ -382,11 +383,11 @@ def train_arch_jepa(
 
     K_PALETTE = 8
     out_channels = oracle_decoder_out_channels("cat-kmeans-unique", K=K_PALETTE)
-    print(f"[{run_name}] JEPA arch={arch_kind} loss={loss_kind} dim={dim} epochs={epochs} rollout_dec={rollout_dec}", flush=True)
+    print(f"[{run_name}] JEPA arch={arch_kind} loss={loss_kind} dim={dim} epochs={epochs} rollout_dec={rollout_dec} grid_cells={grid_cells}", flush=True)
 
-    print(f"[{run_name}] generating {num_episodes} episodes ...", flush=True)
+    print(f"[{run_name}] generating {num_episodes} episodes (grid_cells={grid_cells}) ...", flush=True)
     t0 = time.time()
-    frames_list, actions_list = generate_dataset(num_episodes, seed=seed)
+    frames_list, actions_list = generate_dataset(num_episodes, seed=seed, grid_cells=grid_cells)
     print(f"[{run_name}] dataset built in {time.time()-t0:.1f}s", flush=True)
 
     # T-step windows
@@ -504,7 +505,7 @@ def train_arch_jepa(
         latent_noise=latent_noise, dec_kind=dec_kind, entropy_lambda=entropy_lambda,
         hard_mining=hard_mining, prio_alpha=prio_alpha,
         pred_blocks=pred_blocks, pred_hidden=pred_hidden,
-        vq_K=vq_K, fsq_levels=fsq_levels,
+        vq_K=vq_K, fsq_levels=fsq_levels, grid_cells=grid_cells,
     )
     (run_dir / "config.json").write_text(json.dumps(cfg, indent=2))
 
@@ -653,13 +654,15 @@ def train_arch_jepa(
 # stochastic predictor + entropy reg. Force commitment via discrete VQ codes:
 # predictor's continuous output is snapped to ONE of K codes per cell.
 # Different K and combos to find sweet spot.
+# Grid-size compare: best variants at both 64-cell (1px) and 16-cell (4px) games.
+# Play UI shows GT | AE | JEPA per run for full pipeline diagnosis.
 ARCH_RUNS = [
-    # (run_name,            arch_kind,    dec_kind,  ent,  pred_override,       pb, ph,  fsq_L)
-    ("commit2-control",     "spatial-32", "pixshuf", 0.3,  "stoch-conv",         2, 64,  0),
-    ("commit2-fsq3",        "spatial-32", "pixshuf", 0.3,  "stoch-conv",         2, 64,  3),   # 3^16=43M codes/cell
-    ("commit2-fsq5",        "spatial-32", "pixshuf", 0.3,  "stoch-conv",         2, 64,  5),   # 5^16=152B codes/cell
-    ("commit2-fsq8",        "spatial-32", "pixshuf", 0.3,  "stoch-conv",         2, 64,  8),
-    ("commit2-fsq5-deep",   "spatial-32", "pixshuf", 0.3,  "stoch-conv",         6, 128, 5),
+    # (run_name,            arch_kind,    dec_kind,  ent,  pred_override, pb, ph,  fsq_L, grid_cells)
+    ("g64-control",         "spatial-32", "pixshuf", 0.3,  "stoch-conv",   2, 64,  0,     64),
+    ("g64-fsq5",            "spatial-32", "pixshuf", 0.3,  "stoch-conv",   2, 64,  5,     64),
+    ("g16-control",         "spatial-32", "pixshuf", 0.3,  "stoch-conv",   2, 64,  0,     16),
+    ("g16-fsq5",            "spatial-32", "pixshuf", 0.3,  "stoch-conv",   2, 64,  5,     16),
+    ("g16-fsq3",            "spatial-32", "pixshuf", 0.3,  "stoch-conv",   2, 64,  3,     16),
 ]
 
 
@@ -1507,8 +1510,8 @@ def train_manifold(
 
 @app.local_entrypoint()
 def main():
-    print(f"Spawning {len(ARCH_RUNS)} parallel H100 jobs (commit: FSQ discrete latent) ...")
-    for run_name, arch_kind, dec_kind, ent, pred_override, pb, phid, fsq_L in ARCH_RUNS:
+    print(f"Spawning {len(ARCH_RUNS)} parallel H100 jobs (grid sizes 64 vs 16) ...")
+    for run_name, arch_kind, dec_kind, ent, pred_override, pb, phid, fsq_L, gc in ARCH_RUNS:
         bs = 32 if arch_kind.startswith("spatial-64") else 64
         h = train_arch_jepa.spawn(
             run_name=run_name, arch_kind=arch_kind,
@@ -1521,9 +1524,9 @@ def main():
             dec_kind=dec_kind, entropy_lambda=ent,
             predictor_kind_override=pred_override,
             pred_blocks=pb, pred_hidden=phid,
-            fsq_levels=fsq_L,
+            fsq_levels=fsq_L, grid_cells=gc,
         )
-        print(f"  spawned {run_name} (pred={pred_override}, blocks={pb}x{phid}, fsq_L={fsq_L}): {h.object_id}")
+        print(f"  spawned {run_name} (grid={gc}, pred={pred_override}, fsq_L={fsq_L}): {h.object_id}")
     print("All jobs spawned.")
     return
     # legacy entrypoint below

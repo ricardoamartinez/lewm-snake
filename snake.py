@@ -1,6 +1,9 @@
 """Snake game env + dataset generator.
 
-Grid: 16x16 cells, each cell = 4x4 px -> 64x64 RGB frame.
+Output frame is always 64x64 RGB. The grid_cells parameter sets how many cells
+fit per side: grid_cells=64 → each cell is 1px (current default), grid_cells=16
+→ each cell is 4px (chunky, easier to learn).
+
 Actions: 0=up, 1=down, 2=left, 3=right (absolute).
 Self-reversal turns are ignored (snake keeps last direction).
 """
@@ -9,7 +12,7 @@ import numpy as np
 
 GRID = 64
 CELL = 1
-SIZE = GRID * CELL  # 64 — each pixel is one snake cell
+SIZE = 64  # output frame is always 64x64
 
 COL_BG = (15, 15, 25)
 COL_BODY = (90, 200, 110)
@@ -21,13 +24,17 @@ OPPOSITE = {0: 1, 1: 0, 2: 3, 3: 2}
 
 
 class Snake:
-    def __init__(self, seed=None):
+    def __init__(self, seed=None, grid_cells=64):
         self.rng = np.random.default_rng(seed)
+        self.grid = grid_cells
+        self.cell = SIZE // grid_cells  # px per cell
         self.reset()
 
     def reset(self):
-        cy, cx = GRID // 2, GRID // 2
-        self.body = [(cy, cx), (cy, cx - 1), (cy, cx - 2), (cy, cx - 3), (cy, cx - 4)]
+        cy, cx = self.grid // 2, self.grid // 2
+        # Initial snake length: shorter for smaller grids
+        init_len = min(5, max(2, self.grid // 4))
+        self.body = [(cy, (cx - i) % self.grid) for i in range(init_len)]
         self.dir = 3
         self._place_food()
         self.done = False
@@ -36,7 +43,7 @@ class Snake:
 
     def _place_food(self):
         occupied = set(self.body)
-        free = [(r, c) for r in range(GRID) for c in range(GRID) if (r, c) not in occupied]
+        free = [(r, c) for r in range(self.grid) for c in range(self.grid) if (r, c) not in occupied]
         self.food = free[self.rng.integers(len(free))] if free else None
 
     def step(self, action):
@@ -46,8 +53,7 @@ class Snake:
             self.dir = action
         dy, dx = DIRS[self.dir]
         head = self.body[0]
-        # Toroidal: wrap around edges instead of dying on walls.
-        new_head = ((head[0] + dy) % GRID, (head[1] + dx) % GRID)
+        new_head = ((head[0] + dy) % self.grid, (head[1] + dx) % self.grid)
         if new_head in self.body[:-1]:
             self.done = True
             return self.render(), True
@@ -62,12 +68,13 @@ class Snake:
 
     def render(self):
         img = np.full((SIZE, SIZE, 3), COL_BG, dtype=np.uint8)
+        c = self.cell
         if self.food is not None:
-            r, c = self.food
-            img[r * CELL:(r + 1) * CELL, c * CELL:(c + 1) * CELL] = COL_FOOD
-        for i, (r, c) in enumerate(self.body):
+            r, x = self.food
+            img[r * c:(r + 1) * c, x * c:(x + 1) * c] = COL_FOOD
+        for i, (r, x) in enumerate(self.body):
             color = COL_HEAD if i == 0 else COL_BODY
-            img[r * CELL:(r + 1) * CELL, c * CELL:(c + 1) * CELL] = color
+            img[r * c:(r + 1) * c, x * c:(x + 1) * c] = color
         return img
 
 
@@ -92,14 +99,14 @@ def heuristic_action(env):
         if a == OPPOSITE[env.dir]:
             continue
         dy, dx = DIRS[a]
-        nh = ((head[0] + dy) % GRID, (head[1] + dx) % GRID)
+        nh = ((head[0] + dy) % env.grid, (head[1] + dx) % env.grid)
         if nh not in body_set:
             return a
     return env.dir
 
 
-def generate_episode(seed, max_len=200, p_random=0.15):
-    env = Snake(seed=seed)
+def generate_episode(seed, max_len=200, p_random=0.15, grid_cells=64):
+    env = Snake(seed=seed, grid_cells=grid_cells)
     rng = np.random.default_rng(seed + 9_000_000)
     frames, actions = [env.render()], []
     while len(actions) < max_len:
@@ -251,11 +258,11 @@ def generate_episode_with_state(seed, max_len=200, p_random=0.15):
     return np.stack(frames), np.array(actions, dtype=np.int64), np.stack(states)
 
 
-def generate_dataset(num_episodes, seed=0):
+def generate_dataset(num_episodes, seed=0, grid_cells=64):
     """Returns (frames_list, actions_list) of variable lengths."""
     frames_all, actions_all = [], []
     for i in range(num_episodes):
-        f, a = generate_episode(seed + i)
+        f, a = generate_episode(seed + i, grid_cells=grid_cells)
         frames_all.append(f)
         actions_all.append(a)
     return frames_all, actions_all

@@ -348,6 +348,8 @@ def train_arch_jepa(
     latent_noise: float = 0.0,  # noise added to predicted latents during rollout (drift robustness)
     pred_blocks: int = 2,       # depth of ConvPredictor
     pred_hidden: int = 64,      # width of ConvPredictor
+    hard_mining: str = "none",  # "none", "prio", "topk2x"
+    prio_alpha: float = 1.0,    # priority exponent for "prio" mode (0=uniform, larger=more aggressive)
 ):
     """Full JEPA system with spatial latent: encoder + ConvPredictor + decoder.
     Trains on T-step windows with both pred MSE in latent space and dec CE in pixel space.
@@ -399,12 +401,22 @@ def train_arch_jepa(
         def __len__(self): return len(windows)
         def __getitem__(self, i):
             f, a = windows[i]
-            return torch.from_numpy(f).float().permute(0, 3, 1, 2) / 255.0, torch.from_numpy(a).long()
+            return (torch.from_numpy(f).float().permute(0, 3, 1, 2) / 255.0,
+                    torch.from_numpy(a).long(), i)
 
-    loader = DataLoader(
-        WMSet(), batch_size=batch, shuffle=True, num_workers=4,
-        drop_last=True, pin_memory=True, persistent_workers=True,
-    )
+    # Per-window priority for prioritized replay. Updated each step with the observed loss.
+    # Initialized to large value so unseen windows are always sampled at least once.
+    priorities = torch.ones(len(windows), dtype=torch.float64) * 10.0
+    sample_batch = batch * 2 if hard_mining == "topk2x" else batch
+    if hard_mining == "prio":
+        from torch.utils.data import WeightedRandomSampler
+        # WeightedRandomSampler is rebuilt each epoch with current priorities
+        loader = None  # built per epoch
+    else:
+        loader = DataLoader(
+            WMSet(), batch_size=sample_batch, shuffle=True, num_workers=4,
+            drop_last=True, pin_memory=True, persistent_workers=True,
+        )
 
     # Build architecture. Parse "spatial-LAT[-deep][-bigCh]" patterns.
     is_spatial = arch_kind.startswith("spatial")
@@ -454,53 +466,95 @@ def train_arch_jepa(
     )
     (run_dir / "config.json").write_text(json.dumps(cfg, indent=2))
 
+    def forward_one_window(f_w, a_w):
+        """Run encoder+rollout+decoder on a window batch. Returns:
+            pl: scalar pred MSE loss
+            dec_loss_mean: scalar perclass CE loss (for backprop)
+            per_window_dec: (B,) per-window mean per-pixel CE (for priority signal)
+        """
+        import torch.nn.functional as F
+        B_, T_, C_, H_, W_ = f_w.shape
+        emb = enc(f_w.reshape(B_ * T_, C_, H_, W_))
+        if is_spatial:
+            emb = emb.view(B_, T_, dim, emb.size(-2), emb.size(-1))
+        else:
+            emb = emb.view(B_, T_, dim)
+        act_emb = action_embed(a_w)
+        z_hat = [emb[:, 0]]
+        for t in range(T_ - 1):
+            z_next = pred(z_hat[-1], act_emb[:, t])
+            if latent_noise > 0:
+                z_next = z_next + latent_noise * torch.randn_like(z_next)
+            z_hat.append(z_next)
+        z_hat_stack = torch.stack(z_hat, dim=1)
+        pl = (z_hat_stack[:, 1:] - emb[:, 1:].detach()).pow(2).mean()
+        z_for_dec = z_hat_stack if rollout_dec else emb
+        if is_spatial:
+            raw = dec(z_for_dec.reshape(B_ * T_, dim, z_for_dec.size(-2), z_for_dec.size(-1)))
+        else:
+            raw = dec(z_for_dec.reshape(B_ * T_, dim))
+        pix_target = f_w.reshape(B_ * T_, C_, H_, W_)
+        # Backprop loss: global perclass CE
+        dec_loss_mean = oracle_decoder_loss(
+            raw, pix_target, loss_kind, K=K_PALETTE, palette=palette_t,
+        )
+        # Priority signal: per-window mean per-pixel CE (vectorized, no_grad)
+        with torch.no_grad():
+            p = palette_t.view(1, palette_t.size(0), 3, 1, 1).to(pix_target.dtype)
+            labels = (pix_target.unsqueeze(1) - p).pow(2).sum(dim=2).argmin(dim=1)   # (B*T, H, W)
+            log_probs = F.log_softmax(raw.float(), dim=1)
+            nll = -log_probs.gather(1, labels.unsqueeze(1)).squeeze(1)               # (B*T, H, W)
+            per_window_dec = nll.view(B_, T_, H_, W_).mean(dim=(1, 2, 3))           # (B,)
+        return pl, dec_loss_mean, per_window_dec
+
     train_t0 = time.time()
     for epoch in range(epochs):
         enc.train(); pred.train(); dec.train(); action_embed.train()
         total = {"loss": 0.0, "pred": 0.0, "dec": 0.0}; n = 0
         ep_t0 = time.time()
-        for f, a in loader:
-            f = f.to(device, non_blocking=True)             # (B, T, 3, 64, 64)
-            a = a.to(device, non_blocking=True)             # (B, T-1)
-            B, T_, C, H, W = f.shape
+
+        # For prio mode, rebuild loader each epoch with current priorities
+        if hard_mining == "prio":
+            from torch.utils.data import WeightedRandomSampler
+            weights = priorities ** prio_alpha
+            sampler = WeightedRandomSampler(weights.numpy(), num_samples=len(windows), replacement=True)
+            ep_loader = DataLoader(
+                WMSet(), batch_size=batch, sampler=sampler, num_workers=4,
+                drop_last=True, pin_memory=True, persistent_workers=False,
+            )
+        else:
+            ep_loader = loader
+
+        for f, a, win_idx in ep_loader:
+            f = f.to(device, non_blocking=True)
+            a = a.to(device, non_blocking=True)
             with torch.amp.autocast(**autocast_kw):
-                # Encode all frames
-                emb = enc(f.reshape(B * T_, C, H, W))
-                if is_spatial:
-                    emb = emb.view(B, T_, dim, emb.size(-2), emb.size(-1))
+                if hard_mining == "topk2x":
+                    # Forward on 2x batch, keep top batch_size highest dec loss
+                    with torch.no_grad():
+                        _, _, per_w_dec = forward_one_window(f, a)
+                    top_idx = per_w_dec.topk(batch).indices
+                    f_hard = f[top_idx]
+                    a_hard = a[top_idx]
+                    pred_loss, dec_loss, per_w_dec_hard = forward_one_window(f_hard, a_hard)
+                    win_idx_hard = win_idx[top_idx.cpu()]
+                    update_idx = win_idx_hard
+                    update_loss = per_w_dec_hard.detach()
                 else:
-                    emb = emb.view(B, T_, dim)
-                act_emb = action_embed(a)                    # (B, T-1, dim)
-
-                # Rollout: z_hat[0] = emb[0], then predictor (optionally with drift noise)
-                z_hat = [emb[:, 0]]
-                for t in range(T_ - 1):
-                    z_next = pred(z_hat[-1], act_emb[:, t])
-                    if latent_noise > 0:
-                        z_next = z_next + latent_noise * torch.randn_like(z_next)
-                    z_hat.append(z_next)
-                z_hat_stack = torch.stack(z_hat, dim=1)      # (B, T, dim, [H_lat, W_lat])
-
-                # Pred loss: rollout matches encoded targets (teacher signal)
-                pred_loss = (z_hat_stack[:, 1:] - emb[:, 1:].detach()).pow(2).mean()
-
-                # Dec loss: render and compare to GT pixels
-                z_for_dec = z_hat_stack if rollout_dec else emb
-                if is_spatial:
-                    raw = dec(z_for_dec.reshape(B * T_, dim, z_for_dec.size(-2), z_for_dec.size(-1)))
-                else:
-                    raw = dec(z_for_dec.reshape(B * T_, dim))
-                pix_target = f.reshape(B * T_, C, H, W)
-                dec_loss = oracle_decoder_loss(
-                    raw, pix_target, loss_kind, K=K_PALETTE, palette=palette_t,
-                )
-
+                    pred_loss, dec_loss, per_w_dec = forward_one_window(f, a)
+                    update_idx = win_idx
+                    update_loss = per_w_dec.detach()
                 loss = pred_lambda * pred_loss + dec_lambda * dec_loss
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(params, 1.0)
             opt.step(); sched.step()
+
+            # Update priorities
+            if hard_mining in ("prio",):
+                priorities[update_idx] = update_loss.float().cpu().double()
+
             total["loss"] += loss.item()
             total["pred"] += pred_loss.item()
             total["dec"] += dec_loss.item()
@@ -526,15 +580,16 @@ def train_arch_jepa(
     print(f"[{run_name}] DONE in {time.time()-train_t0:.0f}s", flush=True)
 
 
-# Manifold-drift ablation: prec3 collapsed at step ~20 because training rollout was only T=8.
-# Fix: extend rollout to pred_horizon=32 + experiment with latent noise + bigger predictor.
+# Hard-mining ablation: model collapses on rare events (food eating, body collision)
+# because uniform sampling underweights them. Solutions: prioritized replay (sample
+# windows with prob ∝ loss^α) or topk hard mining. Generalizable, no per-event coding.
 ARCH_RUNS = [
-    # (run_name,                  arch_kind,    pred_horizon, latent_noise, pred_blocks, pred_hidden, batch)
-    ("drift-h32-spatial-32",      "spatial-32",  32,           0.0,          2,           64,          64),
-    ("drift-h32-noise01",         "spatial-32",  32,           0.01,         2,           64,          64),
-    ("drift-h32-noise05",         "spatial-32",  32,           0.05,         2,           64,          64),
-    ("drift-h32-bigPred",         "spatial-32",  32,           0.0,          4,           128,         64),
-    ("drift-h32-spatial-64",      "spatial-64",  32,           0.0,          2,           64,          32),
+    # (run_name,           arch_kind,    hard_mining,  prio_alpha)
+    ("mine-control",       "spatial-32", "none",        0.0),
+    ("mine-prio-a05",      "spatial-32", "prio",        0.5),
+    ("mine-prio-a10",      "spatial-32", "prio",        1.0),
+    ("mine-prio-a20",      "spatial-32", "prio",        2.0),
+    ("mine-topk2x",        "spatial-32", "topk2x",      0.0),
 ]
 
 
@@ -1382,16 +1437,16 @@ def train_manifold(
 
 @app.local_entrypoint()
 def main():
-    print(f"Spawning {len(ARCH_RUNS)} parallel H100 jobs (manifold-drift fix: long rollout) ...")
-    for run_name, arch_kind, ph, ln, pb, phid, bs in ARCH_RUNS:
+    print(f"Spawning {len(ARCH_RUNS)} parallel H100 jobs (hard-mining for rare events) ...")
+    for run_name, arch_kind, mining, alpha in ARCH_RUNS:
         h = train_arch_jepa.spawn(
             run_name=run_name, arch_kind=arch_kind,
             rollout_dec=True, pred_lambda=0.0,
-            history=1, pred_horizon=ph,
-            latent_noise=ln, pred_blocks=pb, pred_hidden=phid,
-            batch=bs,
+            history=1, pred_horizon=32,
+            latent_noise=0.01, batch=64,
+            hard_mining=mining, prio_alpha=alpha,
         )
-        print(f"  spawned {run_name} ({arch_kind}, ph={ph}, ln={ln}, pred={pb}x{phid}, bs={bs}): {h.object_id}")
+        print(f"  spawned {run_name} ({arch_kind}, mining={mining}, α={alpha}): {h.object_id}")
     print("All jobs spawned.")
     return
     # legacy entrypoint below

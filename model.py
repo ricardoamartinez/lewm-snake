@@ -515,6 +515,37 @@ class SpatialEncoder(nn.Module):
         return self.net(x)
 
 
+class SpatialPixShufDecoder(nn.Module):
+    """Spatial decoder using PixelShuffle (sub-pixel reordering) instead of ConvT.
+    Each output cell is a distinct learned function — no upsample-blur. Sharper than
+    ConvT for pixel-precise tasks.
+    """
+    def __init__(self, dim=16, out_channels=8, lat_size=16, base_ch=128, refine_blocks=1):
+        super().__init__()
+        factor = 64 // lat_size
+        layers = [
+            nn.Conv2d(dim, base_ch, 3, 1, 1),
+            nn.GroupNorm(min(8, base_ch), base_ch), nn.SiLU(),
+        ]
+        for _ in range(refine_blocks):
+            layers += [
+                nn.Conv2d(base_ch, base_ch, 3, 1, 1),
+                nn.GroupNorm(min(8, base_ch), base_ch), nn.SiLU(),
+            ]
+        if factor == 1:
+            layers.append(nn.Conv2d(base_ch, out_channels, 1))
+        else:
+            layers += [
+                nn.Conv2d(base_ch, out_channels * factor * factor, 1),
+                nn.PixelShuffle(factor),
+            ]
+        self.net = nn.Sequential(*layers)
+        self.lat_size = lat_size
+
+    def forward(self, z):
+        return self.net(z)
+
+
 class SpatialDecoder(nn.Module):
     """ConvT pyramid that takes a spatial latent (B, dim, lat_H, lat_W) directly.
 

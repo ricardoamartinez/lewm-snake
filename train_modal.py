@@ -350,6 +350,8 @@ def train_arch_jepa(
     pred_hidden: int = 64,      # width of ConvPredictor
     hard_mining: str = "none",  # "none", "prio", "topk2x"
     prio_alpha: float = 1.0,    # priority exponent for "prio" mode (0=uniform, larger=more aggressive)
+    entropy_lambda: float = 0.0,  # entropy regularization on decoder output (penalizes hedged softmax)
+    dec_kind: str = "convt",      # "convt" or "pixshuf"
 ):
     """Full JEPA system with spatial latent: encoder + ConvPredictor + decoder.
     Trains on T-step windows with both pred MSE in latent space and dec CE in pixel space.
@@ -363,7 +365,7 @@ def train_arch_jepa(
 
     from snake import generate_dataset
     from model import (
-        OracleEncoderCNN, TinyDecoder, SpatialEncoder, SpatialDecoder,
+        OracleEncoderCNN, TinyDecoder, SpatialEncoder, SpatialDecoder, SpatialPixShufDecoder,
         MLPPredictor, ConvPredictor, make_predictor,
         kmeans_palette_unique, oracle_decoder_loss, oracle_decoder_out_channels,
     )
@@ -435,8 +437,12 @@ def train_arch_jepa(
         dec_base = 256 if bigch else 128
         enc = SpatialEncoder(in_channels=3, dim=dim, lat_size=lat_size,
                              base_ch=enc_base, refine_blocks=enc_refine).to(device)
-        dec = SpatialDecoder(dim=dim, out_channels=out_channels, lat_size=lat_size,
-                             base_ch=dec_base, refine_blocks=dec_refine).to(device)
+        if dec_kind == "pixshuf":
+            dec = SpatialPixShufDecoder(dim=dim, out_channels=out_channels, lat_size=lat_size,
+                                          base_ch=dec_base, refine_blocks=dec_refine).to(device)
+        else:
+            dec = SpatialDecoder(dim=dim, out_channels=out_channels, lat_size=lat_size,
+                                 base_ch=dec_base, refine_blocks=dec_refine).to(device)
     else:
         raise ValueError(arch_kind)
 
@@ -463,6 +469,8 @@ def train_arch_jepa(
         epochs=epochs, batch=batch, num_episodes=num_episodes,
         history=history, pred_horizon=pred_horizon,
         rollout_dec=rollout_dec, is_spatial=is_spatial,
+        latent_noise=latent_noise, dec_kind=dec_kind, entropy_lambda=entropy_lambda,
+        hard_mining=hard_mining, prio_alpha=prio_alpha,
     )
     (run_dir / "config.json").write_text(json.dumps(cfg, indent=2))
 
@@ -494,10 +502,15 @@ def train_arch_jepa(
         else:
             raw = dec(z_for_dec.reshape(B_ * T_, dim))
         pix_target = f_w.reshape(B_ * T_, C_, H_, W_)
-        # Backprop loss: global perclass CE
+        # Backprop loss: global perclass CE + optional entropy regularization
         dec_loss_mean = oracle_decoder_loss(
             raw, pix_target, loss_kind, K=K_PALETTE, palette=palette_t,
         )
+        if entropy_lambda > 0:
+            log_probs_full = F.log_softmax(raw, dim=1)
+            probs = log_probs_full.exp()
+            entropy_per_pixel = -(probs * log_probs_full).sum(dim=1)              # (B*T, H, W)
+            dec_loss_mean = dec_loss_mean + entropy_lambda * entropy_per_pixel.mean()
         # Priority signal: per-window mean per-pixel CE (vectorized, no_grad)
         with torch.no_grad():
             p = palette_t.view(1, palette_t.size(0), 3, 1, 1).to(pix_target.dtype)
@@ -580,16 +593,18 @@ def train_arch_jepa(
     print(f"[{run_name}] DONE in {time.time()-train_t0:.0f}s", flush=True)
 
 
-# Hard-mining ablation: model collapses on rare events (food eating, body collision)
-# because uniform sampling underweights them. Solutions: prioritized replay (sample
-# windows with prob ∝ loss^α) or topk hard mining. Generalizable, no per-event coding.
+# Artifact-fixing ablation: blob renders + multi-food hedging.
+# Generalizable solutions:
+#  - PixelShuffle decoder (sub-pixel reorder, no upsample-blur) for blob
+#  - Entropy regularization on dec output (penalizes hedged softmax) for multi-food
+# Both also combined with prio hard mining (best from previous round).
 ARCH_RUNS = [
-    # (run_name,           arch_kind,    hard_mining,  prio_alpha)
-    ("mine-control",       "spatial-32", "none",        0.0),
-    ("mine-prio-a05",      "spatial-32", "prio",        0.5),
-    ("mine-prio-a10",      "spatial-32", "prio",        1.0),
-    ("mine-prio-a20",      "spatial-32", "prio",        2.0),
-    ("mine-topk2x",        "spatial-32", "topk2x",      0.0),
+    # (run_name,            arch_kind,    dec_kind,  entropy_lambda)
+    ("art-control",         "spatial-32", "convt",    0.0),
+    ("art-pixshuf",         "spatial-32", "pixshuf",  0.0),
+    ("art-ent03",           "spatial-32", "convt",    0.3),
+    ("art-pixshuf-ent03",   "spatial-32", "pixshuf",  0.3),
+    ("art-pixshuf-ent10",   "spatial-32", "pixshuf",  1.0),
 ]
 
 
@@ -1437,16 +1452,17 @@ def train_manifold(
 
 @app.local_entrypoint()
 def main():
-    print(f"Spawning {len(ARCH_RUNS)} parallel H100 jobs (hard-mining for rare events) ...")
-    for run_name, arch_kind, mining, alpha in ARCH_RUNS:
+    print(f"Spawning {len(ARCH_RUNS)} parallel H100 jobs (artifact fixes: blob + multi-food) ...")
+    for run_name, arch_kind, dec_kind, ent in ARCH_RUNS:
         h = train_arch_jepa.spawn(
             run_name=run_name, arch_kind=arch_kind,
             rollout_dec=True, pred_lambda=0.0,
             history=1, pred_horizon=32,
             latent_noise=0.01, batch=64,
-            hard_mining=mining, prio_alpha=alpha,
+            hard_mining="prio", prio_alpha=1.0,        # prio hard mining (carried over)
+            dec_kind=dec_kind, entropy_lambda=ent,
         )
-        print(f"  spawned {run_name} ({arch_kind}, mining={mining}, α={alpha}): {h.object_id}")
+        print(f"  spawned {run_name} ({arch_kind}, dec={dec_kind}, ent={ent}): {h.object_id}")
     print("All jobs spawned.")
     return
     # legacy entrypoint below

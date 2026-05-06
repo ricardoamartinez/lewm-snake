@@ -146,7 +146,7 @@ def run_arch_jepa_play(args, ckpt_path):
     import torch.nn as nn
     from snake import Snake
     from model import (
-        OracleEncoderCNN, TinyDecoder, SpatialEncoder, SpatialDecoder,
+        OracleEncoderCNN, TinyDecoder, SpatialEncoder, SpatialDecoder, SpatialPixShufDecoder,
         make_predictor, render_oracle_output,
     )
 
@@ -171,10 +171,15 @@ def run_arch_jepa_play(args, ckpt_path):
         dec_refine = 3 if deep else 1
         enc_base = 64 if bigch else 32
         dec_base = 256 if bigch else 128
+        dec_kind = cfg.get("dec_kind", "convt")
         enc = SpatialEncoder(in_channels=3, dim=dim, lat_size=lat_size,
                              base_ch=enc_base, refine_blocks=enc_refine)
-        dec = SpatialDecoder(dim=dim, out_channels=out_channels, lat_size=lat_size,
-                             base_ch=dec_base, refine_blocks=dec_refine)
+        if dec_kind == "pixshuf":
+            dec = SpatialPixShufDecoder(dim=dim, out_channels=out_channels, lat_size=lat_size,
+                                         base_ch=dec_base, refine_blocks=dec_refine)
+        else:
+            dec = SpatialDecoder(dim=dim, out_channels=out_channels, lat_size=lat_size,
+                                 base_ch=dec_base, refine_blocks=dec_refine)
     enc.load_state_dict(blob["encoder_state"]); enc.eval()
     dec.load_state_dict(blob["decoder_state"]); dec.eval()
     pred = make_predictor(pred_kind, dim=dim)

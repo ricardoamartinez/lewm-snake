@@ -495,6 +495,27 @@ def _cat_kmeans_focal_loss(raw, target, palette, gamma=2.0):
     return -(focal * log_p_correct).mean()
 
 
+def _cat_kmeans_fgonly_loss(raw, target, palette, bg_weight=0.0):
+    """CE on FG pixels only (BG class effectively ignored). bg_weight scales BG loss.
+
+    BG class is identified as the most frequent label in the batch (BG is ~99% of pixels).
+    """
+    p = palette.to(target.device, dtype=target.dtype).view(1, palette.size(0), 3, 1, 1)
+    labels = (target.unsqueeze(1) - p).pow(2).sum(dim=2).argmin(dim=1)              # (B, H, W)
+    counts = torch.bincount(labels.flatten(), minlength=palette.size(0))
+    bg_class = int(counts.argmax().item())
+    log_probs = F.log_softmax(raw, dim=1)
+    nll = -log_probs.gather(1, labels.unsqueeze(1)).squeeze(1)                     # (B, H, W)
+    bg_mask = (labels == bg_class).float()
+    fg_mask = 1.0 - bg_mask
+    n_fg = fg_mask.sum().clamp(min=1.0)
+    fg_loss = (nll * fg_mask).sum() / n_fg
+    if bg_weight > 0:
+        bg_loss = (nll * bg_mask).sum() / bg_mask.sum().clamp(min=1.0)
+        return fg_loss + bg_weight * bg_loss
+    return fg_loss
+
+
 def _cat_kmeans_weighted_loss(raw, target, palette, class_weights):
     """Per-pixel CE with per-class inverse-frequency weights."""
     p = palette.to(target.device, dtype=target.dtype).view(1, palette.size(0), 3, 1, 1)
@@ -503,7 +524,7 @@ def _cat_kmeans_weighted_loss(raw, target, palette, class_weights):
     return F.cross_entropy(raw, labels, weight=w)
 
 
-def oracle_decoder_loss(raw, target, loss_kind, K=None, palette=None, class_weights=None):
+def oracle_decoder_loss(raw, target, loss_kind, K=None, palette=None, class_weights=None, focal_gamma=2.0, bg_weight=0.0):
     """Pixel-level loss for the decoder-isolation experiment.
     raw: (B, C, H, W) — raw decoder output, channels depend on loss_kind.
     target: (B, 3, H, W) ground-truth pixels in [0,1].
@@ -534,7 +555,9 @@ def oracle_decoder_loss(raw, target, loss_kind, K=None, palette=None, class_weig
     if loss_kind == "cat-kmeans":
         return _cat_kmeans_loss(raw, target, palette)
     if loss_kind == "cat-kmeans-focal":
-        return _cat_kmeans_focal_loss(raw, target, palette, gamma=2.0)
+        return _cat_kmeans_focal_loss(raw, target, palette, gamma=focal_gamma)
+    if loss_kind == "cat-kmeans-fgonly":
+        return _cat_kmeans_fgonly_loss(raw, target, palette, bg_weight=bg_weight)
     if loss_kind == "cat-kmeans-weighted":
         assert class_weights is not None, "class_weights required for cat-kmeans-weighted"
         return _cat_kmeans_weighted_loss(raw, target, palette, class_weights=class_weights)
@@ -563,7 +586,7 @@ def oracle_decoder_out_channels(loss_kind, K=None):
         return 6
     if loss_kind == "cat":
         return 4
-    if loss_kind in ("cat-kmeans", "cat-kmeans-unique", "cat-kmeans-focal", "cat-kmeans-weighted"):
+    if loss_kind in ("cat-kmeans", "cat-kmeans-unique", "cat-kmeans-focal", "cat-kmeans-weighted", "cat-kmeans-fgonly"):
         assert K is not None
         return K
     if loss_kind == "mol":
@@ -584,7 +607,7 @@ def render_oracle_output(raw, loss_kind, K=None, palette=None):
         labels = raw.argmax(dim=1)
         colors = SNAKE_COLORS.to(raw.device, dtype=raw.dtype)
         return colors[labels].permute(0, 3, 1, 2)
-    if loss_kind in ("cat-kmeans", "cat-kmeans-unique", "cat-kmeans-focal", "cat-kmeans-weighted"):
+    if loss_kind in ("cat-kmeans", "cat-kmeans-unique", "cat-kmeans-focal", "cat-kmeans-weighted", "cat-kmeans-fgonly"):
         labels = raw.argmax(dim=1)
         colors = palette.to(raw.device, dtype=raw.dtype)
         return colors[labels].permute(0, 3, 1, 2)

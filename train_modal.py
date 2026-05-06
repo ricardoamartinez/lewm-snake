@@ -323,10 +323,26 @@ def train_predictor(
     print(f"[{run_name}] DONE", flush=True)
 
 
-# Pinpoint ablation: same loss + dim=16 latent, vary one axis
+# BG-collapse diagnostic ablation: WHY does the model paint all-BG on epoch 1?
+# Each variant disables ONE thing to find out who's at fault.
+# All use mlp predictor, dec_grad=True, dim=16, 50 epochs.
+BG_DIAG_RUNS = [
+    # (run_name,           pred_lambda, sigreg_lambda, dec_lambda, loss_kind,             focal_gamma, bg_weight)
+    # 1) Pure AE, plain CE — does even a SUPERVISED autoencoder paint snake/food on ep1?
+    ("bg-ae-plainCE",      0.0,         0.0,           1.0,        "cat-kmeans-unique",   0.0,         0.0),
+    # 2) Pure AE, focal CE γ=2 — incremental: focal on top of AE
+    ("bg-ae-focalg2",      0.0,         0.0,           1.0,        "cat-kmeans-focal",    2.0,         0.0),
+    # 3) Pure AE, fg-only — extreme imbalance fix (BG completely ignored in loss)
+    ("bg-ae-fgonly",       0.0,         0.0,           1.0,        "cat-kmeans-fgonly",   0.0,         0.0),
+    # 4) Full system, focal γ=5 — much more aggressive focal
+    ("bg-full-focalg5",    1.0,         0.1,           1.0,        "cat-kmeans-focal",    5.0,         0.0),
+    # 5) Full system, dec_loss×10 — same loss but force dec gradient to dominate
+    ("bg-full-dec10x",     1.0,         0.1,           10.0,       "cat-kmeans-focal",    2.0,         0.0),
+]
+
+
+# Legacy ablation (kept for reference — superseded by BG_DIAG_RUNS)
 FULL_SYSTEM_RUNS = [
-    # (run_name, predictor_kind, dec_noise, multi_step, dec_grad)
-    # All variants use dec_grad=True so encoder is forced to encode pixel content
     ("full-mlp-dg",            "mlp",       0.0, 1, True),
     ("full-residual-dg",       "residual",  0.0, 1, True),
     ("full-multistep-dg",      "mlp",       0.0, 4, True),
@@ -356,6 +372,11 @@ def train_full(
     pred_horizon: int = 4,
     dim: int = 16,
     seed: int = 0,
+    loss_kind: str = "cat-kmeans-focal",
+    focal_gamma: float = 2.0,
+    bg_weight: float = 0.0,
+    pred_lambda: float = 1.0,
+    dec_lambda: float = 1.0,
 ):
     import json
     import numpy as np
@@ -482,12 +503,12 @@ def train_full(
                     z_flat = z_flat + dec_noise * torch.randn_like(z_flat)
                 raw = dec(z_flat)
                 pix_target = f.reshape(B * T_, 3, H, W)
-                # FOCAL CE on the K-means-unique palette: forces model to focus on
-                # rare classes (snake/food) instead of plateauing at BG-only.
-                dec_loss = oracle_decoder_loss(raw, pix_target, "cat-kmeans-focal",
-                                                K=K_PALETTE, palette=palette_t)
+                dec_loss = oracle_decoder_loss(
+                    raw, pix_target, loss_kind, K=K_PALETTE, palette=palette_t,
+                    focal_gamma=focal_gamma, bg_weight=bg_weight,
+                )
 
-                loss = pred_loss + sigreg_lambda * sigreg_loss + dec_loss
+                loss = pred_lambda * pred_loss + sigreg_lambda * sigreg_loss + dec_lambda * dec_loss
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -1130,14 +1151,20 @@ def train_manifold(
 
 @app.local_entrypoint()
 def main():
-    print(f"Spawning {len(FULL_SYSTEM_RUNS)} parallel A10G jobs (FULL SYSTEM, dec_grad=True) ...")
-    for run_name, pred_kind, dn, mstep, dg in FULL_SYSTEM_RUNS:
+    print(f"Spawning {len(BG_DIAG_RUNS)} parallel A10G jobs (BG-collapse DIAGNOSTIC ablation) ...")
+    for run_name, pl, sl, dl, lk, fg, bgw in BG_DIAG_RUNS:
         h = train_full.spawn(
             run_name=run_name,
-            predictor_kind=pred_kind,
-            dec_noise=dn,
-            multi_step=mstep,
-            dec_grad=dg,
+            predictor_kind="mlp",
+            dec_noise=0.0,
+            multi_step=1,
+            dec_grad=True,
+            pred_lambda=pl,
+            sigreg_lambda=sl,
+            dec_lambda=dl,
+            loss_kind=lk,
+            focal_gamma=fg,
+            bg_weight=bgw,
         )
         print(f"  spawned {run_name}: {h.object_id}")
     print("All jobs spawned.")

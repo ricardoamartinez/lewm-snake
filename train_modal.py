@@ -752,9 +752,6 @@ def train_manifold(
     valid_transition[ep_ends] = False
     valid_idx_t = torch.from_numpy(np.where(valid_transition)[0]).long().to(device)
 
-    states_t = states_t.to(device)
-    actions_t = actions_t.to(device)
-
     print(f"[{run_name}] N frames {frames_t.size(0)}, N transitions {valid_idx_t.size(0)}", flush=True)
 
     # Stage 1 — train oracle encoder + decoder (with optional noise injection in latent)
@@ -804,6 +801,11 @@ def train_manifold(
         enc.eval(); dec.eval()
         if quantizer is not None: quantizer.eval()
 
+    # Move to device now that DataLoader workers won't access them
+    states_t = states_t.to(device)
+    actions_t = actions_t.to(device)
+    valid_idx_t = valid_idx_t.to(device)
+
     # Pre-encode all states under current oracle (stale during joint training but OK)
     print(f"[{run_name}] encoding all states ...", flush=True)
     Z_list = []
@@ -819,6 +821,7 @@ def train_manifold(
         Z = torch.cat(Z_list, dim=0)
 
     pred_params = list(predictor.parameters()) + list(action_embed.parameters())
+    valid_idx_t = valid_idx_t.to(device)
     if joint:
         pred_params = pred_params + list(enc.parameters()) + list(dec.parameters())
         if quantizer is not None:

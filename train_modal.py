@@ -323,17 +323,17 @@ def train_predictor(
     print(f"[{run_name}] DONE", flush=True)
 
 
-# Bottleneck-capacity diagnostic ablation:
-# All previous BG-fixes failed → the 16-d FLAT bottleneck likely cannot encode
-# snake/food positions through the encoder in 1 epoch. Sweep dim to confirm.
-# All variants: pure AE (no predictor, no sigreg), plain CE on K-means-unique palette.
+# Class-balance ablation: TRUE root-cause is per-pixel loss averaging.
+# GT distribution: BG=4090, body=4, head=1, food=1 (per 4096-pixel frame).
+# Plain CE means head/food contribute 1/4096 of the gradient -> never learned.
+# Test 5 strategies, all pure AE, dim=16, plain training.
 BG_DIAG_RUNS = [
-    # (run_name,         dim,    pred_lambda, sigreg_lambda, dec_lambda, loss_kind,             focal_gamma, bg_weight)
-    ("dim-16-control",   16,     0.0,         0.0,           1.0,        "cat-kmeans-unique",   0.0,         0.0),
-    ("dim-64",           64,     0.0,         0.0,           1.0,        "cat-kmeans-unique",   0.0,         0.0),
-    ("dim-256",          256,    0.0,         0.0,           1.0,        "cat-kmeans-unique",   0.0,         0.0),
-    ("dim-1024",         1024,   0.0,         0.0,           1.0,        "cat-kmeans-unique",   0.0,         0.0),
-    ("dim-4096",         4096,   0.0,         0.0,           1.0,        "cat-kmeans-unique",   0.0,         0.0),
+    # (run_name,            dim, pred_lambda, sigreg_lambda, dec_lambda, loss_kind,                       focal_gamma, bg_weight)
+    ("bal-control",         16,  0.0,         0.0,           1.0,        "cat-kmeans-unique",            0.0,         0.0),
+    ("bal-perclass",        16,  0.0,         0.0,           1.0,        "cat-kmeans-perclass",          0.0,         0.0),
+    ("bal-perclass-focal2", 16,  0.0,         0.0,           1.0,        "cat-kmeans-perclass-focal",    2.0,         0.0),
+    ("bal-weighted",        16,  0.0,         0.0,           1.0,        "cat-kmeans-weighted",          0.0,         0.0),
+    ("bal-focal-g10",       16,  0.0,         0.0,           1.0,        "cat-kmeans-focal",             10.0,        0.0),
 ]
 
 
@@ -429,6 +429,25 @@ def train_full(
     palette_t = palette.to(device)
     print(f"[{run_name}] palette: {palette.tolist()}", flush=True)
 
+    # Compute per-class inverse-frequency weights (used by cat-kmeans-weighted)
+    class_weights_t = None
+    if loss_kind == "cat-kmeans-weighted":
+        sf = sample_pix[:200].permute(0, 3, 1, 2).to(device)  # (N, 3, 64, 64)
+        with torch.no_grad():
+            p_t = palette.to(device, dtype=sf.dtype).view(1, palette.size(0), 3, 1, 1)
+            dist = (sf.unsqueeze(1) - p_t).pow(2).sum(dim=2)
+            labels = dist.argmin(dim=1).reshape(-1)
+            counts = torch.bincount(labels, minlength=palette.size(0)).float()
+        freq = counts / counts.sum().clamp(min=1.0)
+        # Pad to K_PALETTE channels in case palette has fewer than K real entries
+        K_actual = palette.size(0)
+        cw = torch.zeros(K_PALETTE, device=device)
+        cw_real = (1.0 / (freq.sqrt() + 1e-3))
+        cw_real = cw_real * (K_actual / cw_real.sum())
+        cw[:K_actual] = cw_real
+        class_weights_t = cw
+        print(f"[{run_name}] class freq: {freq.tolist()}  weights: {cw.tolist()}", flush=True)
+
     # Build full system: pixel CNN encoder + predictor + decoder
     enc = OracleEncoderCNN(in_channels=3, out_dim=dim).to(device)
     pred = make_predictor(predictor_kind, dim=dim).to(device)
@@ -502,6 +521,7 @@ def train_full(
                 dec_loss = oracle_decoder_loss(
                     raw, pix_target, loss_kind, K=K_PALETTE, palette=palette_t,
                     focal_gamma=focal_gamma, bg_weight=bg_weight,
+                    class_weights=class_weights_t,
                 )
 
                 loss = pred_lambda * pred_loss + sigreg_lambda * sigreg_loss + dec_lambda * dec_loss

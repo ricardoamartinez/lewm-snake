@@ -347,7 +347,7 @@ def train_full(
     dec_noise: float,
     multi_step: int,
     dec_grad: bool = True,
-    epochs: int = 25,
+    epochs: int = 50,
     batch: int = 256,
     lr: float = 5e-4,
     sigreg_lambda: float = 0.1,

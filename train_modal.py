@@ -106,7 +106,7 @@ MANIFOLD_FIX_RUNS = [
 
 @app.function(
     image=image,
-    gpu="H100",
+    gpu="A10G",
     volumes={CKPT_DIR: vol},
     timeout=30 * 60,
 )
@@ -337,7 +337,7 @@ PINPOINT_DIM = 16
 
 @app.function(
     image=image,
-    gpu="H100",
+    gpu="A10G",
     volumes={CKPT_DIR: vol},
     timeout=20 * 60,
 )
@@ -624,7 +624,7 @@ def _make_perpixel(dim, out_channels, img_size=64, hidden=256):
 
 @app.function(
     image=image,
-    gpu="H100",
+    gpu="A10G",
     volumes={CKPT_DIR: vol},
     timeout=60 * 60,
 )
@@ -689,12 +689,48 @@ def train_manifold(
     palette = kmeans_palette_unique(sample_pix.to(device).reshape(-1, 3), K=K_PALETTE).cpu()
     palette_t = palette.to(device)
 
-    # Build models
+    # Build models (predictor + action_embed early so we can save full checkpoints
+    # during the oracle stage too — play windows can pop up immediately)
     enc = OracleEncoderCNN(in_channels=4, out_dim=dim).to(device)
     dec = TinyDecoder(dim=dim, ch=128, out_channels=out_channels).to(device)
     quantizer = make_quantizer(quantizer_kind, dim=dim)
     if quantizer is not None:
         quantizer = quantizer.to(device)
+    predictor = make_predictor(predictor_kind, dim=dim).to(device)
+    action_embed = nn.Embedding(4, dim).to(device)
+
+    run_dir = Path(CKPT_DIR, run_name)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    cfg = dict(
+        run_name=run_name, mode="predictor",
+        predictor_kind=predictor_kind, quantizer_kind=quantizer_kind,
+        joint=joint, multi_step=multi_step, history=history,
+        dim=dim, K=K_PALETTE, out_channels=out_channels,
+        decoder_kind="convt", state_encoding="spatial",
+        state_shape=[4, 64, 64], deep_cnn=False,
+        num_episodes=num_episodes, batch=batch,
+        pred_loss_kind=pred_loss_kind, decoder_noise=decoder_noise,
+    )
+    (run_dir / "config.json").write_text(json.dumps(cfg, indent=2))
+
+    def save_full(stage_name, epoch_num, extra=None):
+        payload = {
+            "epoch": epoch_num, "stage": stage_name,
+            "encoder_state": enc.state_dict(),
+            "decoder_state": dec.state_dict(),
+            "predictor_state": predictor.state_dict(),
+            "action_embed_state": action_embed.state_dict(),
+            "palette": palette,
+            "cfg": cfg,
+        }
+        if quantizer is not None:
+            payload["quantizer_state"] = quantizer.state_dict()
+        if extra:
+            payload.update(extra)
+        ckpt_name = f"{stage_name}_epoch_{epoch_num:03d}.pt"
+        torch.save(payload, run_dir / ckpt_name)
+        torch.save(payload, run_dir / "latest.pt")
+        vol.commit()
 
     # Stack everything into tensors
     all_frames = []
@@ -757,7 +793,8 @@ def train_manifold(
             loss.backward()
             opt1.step(); sched1.step()
             total += loss.item(); n += 1
-        print(f"[{run_name}] oracle ep {epoch+1}/{oracle_epochs} loss={total/n:.4f} ({time.time()-ep_t0:.1f}s)", flush=True)
+        save_full("oracle", epoch + 1, extra={"oracle_loss": total / max(n, 1)})
+        print(f"[{run_name}] oracle ep {epoch+1}/{oracle_epochs} loss={total/n:.4f} ({time.time()-ep_t0:.1f}s) [saved]", flush=True)
 
     if not joint:
         for p in enc.parameters(): p.requires_grad_(False)
@@ -781,8 +818,6 @@ def train_manifold(
             Z_list.append(z.float())
         Z = torch.cat(Z_list, dim=0)
 
-    predictor = make_predictor(predictor_kind, dim=dim).to(device)
-    action_embed = nn.Embedding(4, dim).to(device)
     pred_params = list(predictor.parameters()) + list(action_embed.parameters())
     if joint:
         pred_params = pred_params + list(enc.parameters()) + list(dec.parameters())
@@ -886,34 +921,8 @@ def train_manifold(
             opt2.step(); sched2.step()
             total += loss.item(); n += 1
 
-        run_dir = Path(CKPT_DIR, run_name)
-        run_dir.mkdir(parents=True, exist_ok=True)
-        cfg = dict(
-            run_name=run_name, mode="predictor",
-            predictor_kind=predictor_kind, quantizer_kind=quantizer_kind,
-            joint=joint, multi_step=multi_step, history=history,
-            dim=dim, K=K_PALETTE, out_channels=out_channels,
-            decoder_kind="convt", state_encoding="spatial",
-            state_shape=[4, 64, 64], deep_cnn=False,
-            num_episodes=num_episodes, batch=batch,
-            pred_loss_kind=pred_loss_kind, decoder_noise=decoder_noise,
-        )
-        (run_dir / "config.json").write_text(json.dumps(cfg, indent=2))
-        payload = {
-            "epoch": epoch + 1, "step": (epoch + 1) * n,
-            "encoder_state": enc.state_dict(),
-            "decoder_state": dec.state_dict(),
-            "predictor_state": predictor.state_dict(),
-            "action_embed_state": action_embed.state_dict(),
-            "palette": palette,
-            "cfg": cfg,
-        }
-        if quantizer is not None:
-            payload["quantizer_state"] = quantizer.state_dict()
-        torch.save(payload, run_dir / "latest.pt")
-        torch.save(payload, run_dir / f"epoch_{epoch+1:03d}.pt")
-        vol.commit()
-        print(f"[{run_name}] predictor ep {epoch+1}/{pred_epochs} loss={total/n:.5f} ({time.time()-ep_t0:.1f}s)", flush=True)
+        save_full("pred", epoch + 1, extra={"predictor_loss": total / max(n, 1)})
+        print(f"[{run_name}] predictor ep {epoch+1}/{pred_epochs} loss={total/n:.5f} ({time.time()-ep_t0:.1f}s) [saved]", flush=True)
 
     print(f"[{run_name}] DONE", flush=True)
 

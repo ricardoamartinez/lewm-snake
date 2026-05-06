@@ -628,11 +628,11 @@ def train_arch_jepa(
 # self-attention (true global). Combined with stochastic noise for commitment.
 ARCH_RUNS = [
     # (run_name,                  arch_kind,    dec_kind,  ent,  pred_override,        pred_blocks, pred_hidden)
-    ("rf3-stoch-control",         "spatial-32", "pixshuf", 0.3,  "stoch-conv",          2,           64),
-    ("rf3-deep-stoch",            "spatial-32", "pixshuf", 0.3,  "stoch-conv",          6,           128),
-    ("rf3-global-stoch",          "spatial-32", "pixshuf", 0.3,  "global-stoch-conv",   2,           64),
-    ("rf3-attn-stoch",            "spatial-32", "pixshuf", 0.3,  "attn-stoch",          2,           64),
-    ("rf3-attn-deep",             "spatial-32", "pixshuf", 0.3,  "attn",                4,           128),
+    ("rf4-stoch-control",         "spatial-32", "pixshuf", 0.3,  "stoch-conv",          2,           64),
+    ("rf4-deep-stoch",            "spatial-32", "pixshuf", 0.3,  "stoch-conv",          6,           128),
+    ("rf4-global-stoch",          "spatial-32", "pixshuf", 0.3,  "global-stoch-conv",   2,           64),
+    ("rf4-attn-stoch",            "spatial-32", "pixshuf", 0.3,  "attn-stoch",          2,           64),
+    ("rf4-attn-deep",             "spatial-32", "pixshuf", 0.3,  "attn",                4,           128),
 ]
 
 
@@ -1480,16 +1480,16 @@ def train_manifold(
 
 @app.local_entrypoint()
 def main():
-    print(f"Spawning {len(ARCH_RUNS)} parallel H100 jobs (RF fix, full data + step cap) ...")
+    print(f"Spawning {len(ARCH_RUNS)} parallel H100 jobs (RF fix, batch=64 + step cap) ...")
     for run_name, arch_kind, dec_kind, ent, pred_override, pb, phid in ARCH_RUNS:
-        bs = 64 if arch_kind.startswith("spatial-64") else 128
+        bs = 32 if arch_kind.startswith("spatial-64") else 64
         h = train_arch_jepa.spawn(
             run_name=run_name, arch_kind=arch_kind,
             rollout_dec=True, pred_lambda=0.0,
-            history=1, pred_horizon=32,           # full drift coverage
+            history=1, pred_horizon=32,
             latent_noise=0.01, batch=bs,
-            num_episodes=1500,                    # full data → full food-event coverage
-            steps_per_epoch_cap=250,              # cap → fast iter (~50s/epoch)
+            num_episodes=1500,
+            steps_per_epoch_cap=500,              # 500 × 64 = 32k samples/epoch
             hard_mining="prio", prio_alpha=1.0,
             dec_kind=dec_kind, entropy_lambda=ent,
             predictor_kind_override=pred_override,

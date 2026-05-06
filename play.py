@@ -992,6 +992,28 @@ def run_combo_play(args):
                         with torch.no_grad():
                             r["z"] = r["model"]["enc"](f0)
                     step_idx = 0
+                elif event.key == pygame.K_r:
+                    # Reload each row's latest checkpoint from the volume
+                    print(f"[combo] reloading {len(rows)} runs ...")
+                    for r in rows:
+                        new_ckpt = pull_checkpoint("latest.pt", run=r["run"])
+                        if not new_ckpt.exists(): continue
+                        blob2 = torch.load(new_ckpt, map_location="cpu", weights_only=False)
+                        r["model"]["enc"].load_state_dict(blob2["encoder_state"])
+                        r["model"]["dec"].load_state_dict(blob2["decoder_state"])
+                        r["model"]["pred"].load_state_dict(blob2["predictor_state"])
+                        r["model"]["act_embed"].load_state_dict(blob2["action_embed_state"])
+                        if r["model"]["vq"] is not None and "vq_state" in blob2:
+                            r["model"]["vq"].load_state_dict(blob2["vq_state"])
+                        r["model"]["ep"] = blob2.get("epoch", "?")
+                        # Re-seed JEPA latent from current frame
+                        f0 = torch.from_numpy(r["env"].render()).float().permute(2, 0, 1).unsqueeze(0).to(args.device) / 255.0
+                        with torch.no_grad():
+                            r["z"] = r["model"]["enc"](f0)
+                        print(f"  {r['run']}: reloaded ep={r['model']['ep']}")
+                    pygame.display.set_caption(
+                        "LeWM-Snake combo  " + "  ".join(f"{r['run']}:ep{r['model']['ep']}" for r in rows)
+                    )
                 elif event.key in KEY_TO_ACTION:
                     current_action = KEY_TO_ACTION[event.key]
 

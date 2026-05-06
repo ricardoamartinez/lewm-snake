@@ -327,13 +327,13 @@ def train_predictor(
     image=image,
     gpu="H100",
     volumes={CKPT_DIR: vol},
-    timeout=60 * 60,
+    timeout=4 * 60 * 60,           # 4h max per run (100 epochs at ~20s/epoch = ~33min, plenty)
 )
 def train_arch_jepa(
     run_name: str,
     arch_kind: str,             # "flat", "spatial-16", "spatial-8", "spatial-4"
     loss_kind: str = "cat-kmeans-perclass",
-    epochs: int = 30,
+    epochs: int = 100,
     batch: int = 128,
     lr: float = 5e-4,
     num_episodes: int = 1500,

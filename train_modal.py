@@ -352,6 +352,7 @@ def train_arch_jepa(
     prio_alpha: float = 1.0,    # priority exponent for "prio" mode (0=uniform, larger=more aggressive)
     entropy_lambda: float = 0.0,  # entropy regularization on decoder output (penalizes hedged softmax)
     dec_kind: str = "convt",      # "convt" or "pixshuf"
+    predictor_kind_override: str = "",  # "" = auto, "stoch-conv" = stochastic conv predictor
 ):
     """Full JEPA system with spatial latent: encoder + ConvPredictor + decoder.
     Trains on T-step windows with both pred MSE in latent space and dec CE in pixel space.
@@ -366,7 +367,7 @@ def train_arch_jepa(
     from snake import generate_dataset
     from model import (
         OracleEncoderCNN, TinyDecoder, SpatialEncoder, SpatialDecoder, SpatialPixShufDecoder,
-        MLPPredictor, ConvPredictor, make_predictor,
+        MLPPredictor, ConvPredictor, StochasticConvPredictor, make_predictor,
         kmeans_palette_unique, oracle_decoder_loss, oracle_decoder_out_channels,
     )
 
@@ -446,10 +447,14 @@ def train_arch_jepa(
     else:
         raise ValueError(arch_kind)
 
-    if pred_kind == "conv":
+    effective_pred_kind = predictor_kind_override or pred_kind
+    if effective_pred_kind == "conv":
         pred = ConvPredictor(dim=dim, hidden=pred_hidden, n_blocks=pred_blocks).to(device)
+    elif effective_pred_kind == "stoch-conv":
+        pred = StochasticConvPredictor(dim=dim, hidden=pred_hidden, n_blocks=pred_blocks).to(device)
     else:
-        pred = make_predictor(pred_kind, dim=dim).to(device)
+        pred = make_predictor(effective_pred_kind, dim=dim).to(device)
+    pred_kind = effective_pred_kind
     action_embed = nn.Embedding(4, dim).to(device)
 
     params = (list(enc.parameters()) + list(pred.parameters())
@@ -593,18 +598,19 @@ def train_arch_jepa(
     print(f"[{run_name}] DONE in {time.time()-train_t0:.0f}s", flush=True)
 
 
-# Artifact-fixing ablation: blob renders + multi-food hedging.
-# Generalizable solutions:
-#  - PixelShuffle decoder (sub-pixel reorder, no upsample-blur) for blob
-#  - Entropy regularization on dec output (penalizes hedged softmax) for multi-food
-# Both also combined with prio hard mining (best from previous round).
+# Artifact ablation v2: pixshuf+ent helped some but snake shape still imperfect
+# and multi-food still appears. Deeper fixes:
+#  - spatial-64: 1 cell per pixel = no upsample at all = no blur structurally possible
+#  - StochasticConvPredictor: samples ONE concrete trajectory (not the average over
+#    plausible futures) — fixes multi-food hedging at the source
+#  - Bigger decoder: more capacity to coordinate neighbor pixels (snake shape)
 ARCH_RUNS = [
-    # (run_name,            arch_kind,    dec_kind,  entropy_lambda)
-    ("art-control",         "spatial-32", "convt",    0.0),
-    ("art-pixshuf",         "spatial-32", "pixshuf",  0.0),
-    ("art-ent03",           "spatial-32", "convt",    0.3),
-    ("art-pixshuf-ent03",   "spatial-32", "pixshuf",  0.3),
-    ("art-pixshuf-ent10",   "spatial-32", "pixshuf",  1.0),
+    # (run_name,                    arch_kind,             dec_kind,  ent,  pred_override)
+    ("art2-sp64-pixshuf",           "spatial-64",          "pixshuf", 0.3,  ""),
+    ("art2-sp64-stoch",             "spatial-64",          "pixshuf", 0.3,  "stoch-conv"),
+    ("art2-sp32-stoch-pixshuf",     "spatial-32",          "pixshuf", 0.3,  "stoch-conv"),
+    ("art2-sp32-deep-bigCh-pix",    "spatial-32-deep-bigCh", "pixshuf", 0.3, ""),
+    ("art2-sp64-deep",              "spatial-64-deep",     "pixshuf", 0.3,  ""),
 ]
 
 
@@ -1452,17 +1458,20 @@ def train_manifold(
 
 @app.local_entrypoint()
 def main():
-    print(f"Spawning {len(ARCH_RUNS)} parallel H100 jobs (artifact fixes: blob + multi-food) ...")
-    for run_name, arch_kind, dec_kind, ent in ARCH_RUNS:
+    print(f"Spawning {len(ARCH_RUNS)} parallel H100 jobs (artifact v2: spatial-64 + stochastic) ...")
+    for run_name, arch_kind, dec_kind, ent, pred_override in ARCH_RUNS:
+        # spatial-64 needs smaller batch due to full-res rollout memory
+        bs = 32 if arch_kind.startswith("spatial-64") else 64
         h = train_arch_jepa.spawn(
             run_name=run_name, arch_kind=arch_kind,
             rollout_dec=True, pred_lambda=0.0,
             history=1, pred_horizon=32,
-            latent_noise=0.01, batch=64,
-            hard_mining="prio", prio_alpha=1.0,        # prio hard mining (carried over)
+            latent_noise=0.01, batch=bs,
+            hard_mining="prio", prio_alpha=1.0,
             dec_kind=dec_kind, entropy_lambda=ent,
+            predictor_kind_override=pred_override,
         )
-        print(f"  spawned {run_name} ({arch_kind}, dec={dec_kind}, ent={ent}): {h.object_id}")
+        print(f"  spawned {run_name} ({arch_kind}, dec={dec_kind}, ent={ent}, pred={pred_override or 'auto'}): {h.object_id}")
     print("All jobs spawned.")
     return
     # legacy entrypoint below

@@ -379,6 +379,38 @@ class ConvPredictor(nn.Module):
         return z + self.out_proj(h)
 
 
+class StochasticConvPredictor(nn.Module):
+    """Stochastic JEPA conv predictor: samples a noise tensor each call so the
+    network can output one concrete future rather than the AVERAGE over plausible
+    futures. Fixes multi-food / hedged renders by committing to a single trajectory.
+    """
+    def __init__(self, dim: int = 16, hidden: int = 64, n_blocks: int = 2, noise_dim: int = 8):
+        super().__init__()
+        self.dim = dim
+        self.noise_dim = noise_dim
+        self.in_proj = nn.Conv2d(dim + noise_dim, hidden, 3, 1, 1)
+        self.blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.GroupNorm(min(8, hidden), hidden), nn.GELU(),
+                nn.Conv2d(hidden, hidden, 3, 1, 1),
+                nn.GroupNorm(min(8, hidden), hidden), nn.GELU(),
+                nn.Conv2d(hidden, hidden, 3, 1, 1),
+            ) for _ in range(n_blocks)
+        ])
+        self.out_proj = nn.Conv2d(hidden, dim, 3, 1, 1)
+
+    def forward(self, z, action_emb, noise=None):
+        B, _, H, W = z.shape
+        if noise is None:
+            noise = torch.randn(B, self.noise_dim, H, W, device=z.device, dtype=z.dtype)
+        a = action_emb.unsqueeze(-1).unsqueeze(-1)
+        x = torch.cat([z + a, noise], dim=1)
+        h = self.in_proj(x)
+        for blk in self.blocks:
+            h = h + blk(h)
+        return z + self.out_proj(h)
+
+
 def make_predictor(kind: str, dim: int = 16):
     if kind == "mlp":         return MLPPredictor(dim=dim, residual=False)
     if kind == "residual":    return MLPPredictor(dim=dim, residual=True)

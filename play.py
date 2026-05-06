@@ -147,7 +147,7 @@ def run_arch_jepa_play(args, ckpt_path):
     from snake import Snake
     from model import (
         OracleEncoderCNN, TinyDecoder, SpatialEncoder, SpatialDecoder, SpatialPixShufDecoder,
-        make_predictor, render_oracle_output,
+        ConvPredictor, StochasticConvPredictor, make_predictor, render_oracle_output,
     )
 
     blob = torch.load(ckpt_path, map_location="cpu", weights_only=False)
@@ -182,7 +182,10 @@ def run_arch_jepa_play(args, ckpt_path):
                                  base_ch=dec_base, refine_blocks=dec_refine)
     enc.load_state_dict(blob["encoder_state"]); enc.eval()
     dec.load_state_dict(blob["decoder_state"]); dec.eval()
-    pred = make_predictor(pred_kind, dim=dim)
+    if pred_kind == "stoch-conv":
+        pred = StochasticConvPredictor(dim=dim, hidden=64, n_blocks=2)
+    else:
+        pred = make_predictor(pred_kind, dim=dim)
     pred.load_state_dict(blob["predictor_state"]); pred.eval()
     act_embed = nn.Embedding(4, dim)
     act_embed.load_state_dict(blob["action_embed_state"]); act_embed.eval()

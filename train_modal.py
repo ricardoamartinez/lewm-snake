@@ -613,11 +613,11 @@ def train_arch_jepa(
 # self-attention (true global). Combined with stochastic noise for commitment.
 ARCH_RUNS = [
     # (run_name,                  arch_kind,    dec_kind,  ent,  pred_override,        pred_blocks, pred_hidden)
-    ("rf-stoch-control",          "spatial-32", "pixshuf", 0.3,  "stoch-conv",          2,           64),
-    ("rf-deep-stoch",             "spatial-32", "pixshuf", 0.3,  "stoch-conv",          6,           128),
-    ("rf-global-stoch",           "spatial-32", "pixshuf", 0.3,  "global-stoch-conv",   2,           64),
-    ("rf-attn-stoch",             "spatial-32", "pixshuf", 0.3,  "attn-stoch",          2,           64),
-    ("rf-attn-deep",              "spatial-32", "pixshuf", 0.3,  "attn",                4,           128),
+    ("rf2-stoch-control",         "spatial-32", "pixshuf", 0.3,  "stoch-conv",          2,           64),
+    ("rf2-deep-stoch",            "spatial-32", "pixshuf", 0.3,  "stoch-conv",          6,           128),
+    ("rf2-global-stoch",          "spatial-32", "pixshuf", 0.3,  "global-stoch-conv",   2,           64),
+    ("rf2-attn-stoch",            "spatial-32", "pixshuf", 0.3,  "attn-stoch",          2,           64),
+    ("rf2-attn-deep",             "spatial-32", "pixshuf", 0.3,  "attn",                4,           128),
 ]
 
 
@@ -1465,14 +1465,15 @@ def train_manifold(
 
 @app.local_entrypoint()
 def main():
-    print(f"Spawning {len(ARCH_RUNS)} parallel H100 jobs (receptive-field fix for food-collapse) ...")
+    print(f"Spawning {len(ARCH_RUNS)} parallel H100 jobs (RF fix, fast: ep < 60s) ...")
     for run_name, arch_kind, dec_kind, ent, pred_override, pb, phid in ARCH_RUNS:
-        bs = 32 if arch_kind.startswith("spatial-64") else 64
+        bs = 64 if arch_kind.startswith("spatial-64") else 128
         h = train_arch_jepa.spawn(
             run_name=run_name, arch_kind=arch_kind,
             rollout_dec=True, pred_lambda=0.0,
-            history=1, pred_horizon=32,
+            history=1, pred_horizon=24,
             latent_noise=0.01, batch=bs,
+            num_episodes=200,
             hard_mining="prio", prio_alpha=1.0,
             dec_kind=dec_kind, entropy_lambda=ent,
             predictor_kind_override=pred_override,

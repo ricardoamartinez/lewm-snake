@@ -359,7 +359,7 @@ def train_arch_jepa(
     from snake import generate_dataset
     from model import (
         OracleEncoderCNN, TinyDecoder, SpatialEncoder, SpatialDecoder,
-        MLPPredictor, ConvPredictor,
+        MLPPredictor, ConvPredictor, make_predictor,
         kmeans_palette_unique, oracle_decoder_loss, oracle_decoder_out_channels,
     )
 

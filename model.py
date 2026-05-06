@@ -278,6 +278,25 @@ class VQ(nn.Module):
         return z_q_st, self.commit_weight * commit_loss, idx
 
 
+class SpatialVQ(nn.Module):
+    """VQ on spatial latent: forces each cell to commit to one of K codes.
+    Breaks the "averaging across plausible futures" failure mode — predicted
+    latents are snapped to discrete codes, so even averaged predictions
+    deterministically pick ONE code rather than render the mean.
+    """
+    def __init__(self, dim: int, K: int = 512):
+        super().__init__()
+        self.vq = VQ(dim=dim, K=K)
+
+    def forward(self, z):
+        # z: (B, dim, H, W) -> (B, dim, H, W) (quantized)
+        B, D, H, W = z.shape
+        z_perm = z.permute(0, 2, 3, 1).contiguous()                        # (B, H, W, dim)
+        z_q, commit, _idx = self.vq(z_perm)
+        z_q = z_q.permute(0, 3, 1, 2).contiguous()
+        return z_q, commit
+
+
 def make_quantizer(kind: str, dim: int):
     if kind == "none":
         return None

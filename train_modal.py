@@ -354,6 +354,7 @@ def train_arch_jepa(
     dec_kind: str = "convt",      # "convt" or "pixshuf"
     predictor_kind_override: str = "",  # "" = auto, "stoch-conv" = stochastic conv predictor
     steps_per_epoch_cap: int = 0,  # if > 0, sample only this many batches per epoch (fast iter)
+    vq_K: int = 0,                  # if > 0, apply VQ with K codes between predictor and decoder
 ):
     """Full JEPA system with spatial latent: encoder + ConvPredictor + decoder.
     Trains on T-step windows with both pred MSE in latent space and dec CE in pixel space.
@@ -369,7 +370,7 @@ def train_arch_jepa(
     from model import (
         OracleEncoderCNN, TinyDecoder, SpatialEncoder, SpatialDecoder, SpatialPixShufDecoder,
         MLPPredictor, ConvPredictor, StochasticConvPredictor, GlobalConvPredictor, AttnPredictor,
-        make_predictor,
+        SpatialVQ, make_predictor,
         kmeans_palette_unique, oracle_decoder_loss, oracle_decoder_out_channels,
     )
 
@@ -473,8 +474,12 @@ def train_arch_jepa(
     pred_kind = effective_pred_kind
     action_embed = nn.Embedding(4, dim).to(device)
 
+    vq = SpatialVQ(dim=dim, K=vq_K).to(device) if vq_K > 0 else None
+
     params = (list(enc.parameters()) + list(pred.parameters())
               + list(dec.parameters()) + list(action_embed.parameters()))
+    if vq is not None:
+        params += list(vq.parameters())
     n_params = sum(p.numel() for p in params)
     print(f"[{run_name}] params: {n_params/1e6:.2f}M  pred={pred_kind}  steps/epoch: {steps_per_epoch}", flush=True)
 
@@ -492,6 +497,8 @@ def train_arch_jepa(
         rollout_dec=rollout_dec, is_spatial=is_spatial,
         latent_noise=latent_noise, dec_kind=dec_kind, entropy_lambda=entropy_lambda,
         hard_mining=hard_mining, prio_alpha=prio_alpha,
+        pred_blocks=pred_blocks, pred_hidden=pred_hidden,
+        vq_K=vq_K,
     )
     (run_dir / "config.json").write_text(json.dumps(cfg, indent=2))
 
@@ -510,10 +517,14 @@ def train_arch_jepa(
             emb = emb.view(B_, T_, dim)
         act_emb = action_embed(a_w)
         z_hat = [emb[:, 0]]
+        commit_loss_total = z_hat[0].new_zeros(())
         for t in range(T_ - 1):
             z_next = pred(z_hat[-1], act_emb[:, t])
             if latent_noise > 0:
                 z_next = z_next + latent_noise * torch.randn_like(z_next)
+            if vq is not None:
+                z_next, c_loss = vq(z_next)
+                commit_loss_total = commit_loss_total + c_loss
             z_hat.append(z_next)
         z_hat_stack = torch.stack(z_hat, dim=1)
         pl = (z_hat_stack[:, 1:] - emb[:, 1:].detach()).pow(2).mean()
@@ -532,6 +543,8 @@ def train_arch_jepa(
             probs = log_probs_full.exp()
             entropy_per_pixel = -(probs * log_probs_full).sum(dim=1)              # (B*T, H, W)
             dec_loss_mean = dec_loss_mean + entropy_lambda * entropy_per_pixel.mean()
+        if vq is not None:
+            dec_loss_mean = dec_loss_mean + commit_loss_total / max(T_ - 1, 1)
         # Priority signal: per-window mean per-pixel CE (vectorized, no_grad)
         with torch.no_grad():
             p = palette_t.view(1, palette_t.size(0), 3, 1, 1).to(pix_target.dtype)
@@ -612,6 +625,8 @@ def train_arch_jepa(
             "cfg": cfg,
             **{k: total[k] / max(n, 1) for k in total},
         }
+        if vq is not None:
+            payload["vq_state"] = vq.state_dict()
         torch.save(payload, run_dir / f"epoch_{epoch+1:03d}.pt")
         torch.save(payload, run_dir / "latest.pt")
         vol.commit()
@@ -626,13 +641,17 @@ def train_arch_jepa(
 # global info (food respawn position is anywhere on map) in 5x5 local conv RF.
 # Solutions: deeper conv (bigger RF), global-pool-broadcast (cheap global),
 # self-attention (true global). Combined with stochastic noise for commitment.
+# Commit ablation: previous runs averaged over plausible futures even with
+# stochastic predictor + entropy reg. Force commitment via discrete VQ codes:
+# predictor's continuous output is snapped to ONE of K codes per cell.
+# Different K and combos to find sweet spot.
 ARCH_RUNS = [
-    # (run_name,                  arch_kind,    dec_kind,  ent,  pred_override,        pred_blocks, pred_hidden)
-    ("rf4-stoch-control",         "spatial-32", "pixshuf", 0.3,  "stoch-conv",          2,           64),
-    ("rf4-deep-stoch",            "spatial-32", "pixshuf", 0.3,  "stoch-conv",          6,           128),
-    ("rf4-global-stoch",          "spatial-32", "pixshuf", 0.3,  "global-stoch-conv",   2,           64),
-    ("rf4-attn-stoch",            "spatial-32", "pixshuf", 0.3,  "attn-stoch",          2,           64),
-    ("rf4-attn-deep",             "spatial-32", "pixshuf", 0.3,  "attn",                4,           128),
+    # (run_name,            arch_kind,    dec_kind,  ent,  pred_override,        pb, ph,  vq_K)
+    ("commit-control",      "spatial-32", "pixshuf", 0.3,  "stoch-conv",          2, 64,  0),
+    ("commit-vq128",        "spatial-32", "pixshuf", 0.3,  "stoch-conv",          2, 64,  128),
+    ("commit-vq512",        "spatial-32", "pixshuf", 0.3,  "stoch-conv",          2, 64,  512),
+    ("commit-vq2048",       "spatial-32", "pixshuf", 0.3,  "stoch-conv",          2, 64,  2048),
+    ("commit-vq512-deep",   "spatial-32", "pixshuf", 0.3,  "stoch-conv",          6, 128, 512),
 ]
 
 
@@ -1480,8 +1499,8 @@ def train_manifold(
 
 @app.local_entrypoint()
 def main():
-    print(f"Spawning {len(ARCH_RUNS)} parallel H100 jobs (RF fix, batch=64 + step cap) ...")
-    for run_name, arch_kind, dec_kind, ent, pred_override, pb, phid in ARCH_RUNS:
+    print(f"Spawning {len(ARCH_RUNS)} parallel H100 jobs (commit: VQ discrete latent) ...")
+    for run_name, arch_kind, dec_kind, ent, pred_override, pb, phid, vq_K in ARCH_RUNS:
         bs = 32 if arch_kind.startswith("spatial-64") else 64
         h = train_arch_jepa.spawn(
             run_name=run_name, arch_kind=arch_kind,
@@ -1489,13 +1508,14 @@ def main():
             history=1, pred_horizon=32,
             latent_noise=0.01, batch=bs,
             num_episodes=1500,
-            steps_per_epoch_cap=500,              # 500 × 64 = 32k samples/epoch
+            steps_per_epoch_cap=500,
             hard_mining="prio", prio_alpha=1.0,
             dec_kind=dec_kind, entropy_lambda=ent,
             predictor_kind_override=pred_override,
             pred_blocks=pb, pred_hidden=phid,
+            vq_K=vq_K,
         )
-        print(f"  spawned {run_name} (pred={pred_override}, blocks={pb}x{phid}): {h.object_id}")
+        print(f"  spawned {run_name} (pred={pred_override}, blocks={pb}x{phid}, vq_K={vq_K}): {h.object_id}")
     print("All jobs spawned.")
     return
     # legacy entrypoint below

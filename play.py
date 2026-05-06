@@ -148,7 +148,7 @@ def run_arch_jepa_play(args, ckpt_path):
     from model import (
         OracleEncoderCNN, TinyDecoder, SpatialEncoder, SpatialDecoder, SpatialPixShufDecoder,
         ConvPredictor, StochasticConvPredictor, GlobalConvPredictor, AttnPredictor,
-        make_predictor, render_oracle_output,
+        SpatialVQ, make_predictor, render_oracle_output,
     )
 
     blob = torch.load(ckpt_path, map_location="cpu", weights_only=False)
@@ -183,21 +183,36 @@ def run_arch_jepa_play(args, ckpt_path):
                                  base_ch=dec_base, refine_blocks=dec_refine)
     enc.load_state_dict(blob["encoder_state"]); enc.eval()
     dec.load_state_dict(blob["decoder_state"]); dec.eval()
+    pb = cfg.get("pred_blocks", 2)
+    phid = cfg.get("pred_hidden", 64)
+    # Fallback for old checkpoints that don't have pred_blocks/pred_hidden saved
+    rn = cfg.get("run_name", "")
+    if "deep-stoch" in rn:
+        pb, phid = 6, 128
+    elif "attn-deep" in rn:
+        pb, phid = 4, 128
     if pred_kind == "stoch-conv":
-        pred = StochasticConvPredictor(dim=dim, hidden=64, n_blocks=2)
+        pred = StochasticConvPredictor(dim=dim, hidden=phid, n_blocks=pb)
     elif pred_kind == "global-conv":
-        pred = GlobalConvPredictor(dim=dim, hidden=64, n_blocks=2, stochastic=False)
+        pred = GlobalConvPredictor(dim=dim, hidden=phid, n_blocks=pb, stochastic=False)
     elif pred_kind == "global-stoch-conv":
-        pred = GlobalConvPredictor(dim=dim, hidden=64, n_blocks=2, stochastic=True)
+        pred = GlobalConvPredictor(dim=dim, hidden=phid, n_blocks=pb, stochastic=True)
     elif pred_kind == "attn":
-        pred = AttnPredictor(dim=dim, hidden=64, n_blocks=2, stochastic=False)
+        pred = AttnPredictor(dim=dim, hidden=phid, n_blocks=pb, stochastic=False)
     elif pred_kind == "attn-stoch":
-        pred = AttnPredictor(dim=dim, hidden=64, n_blocks=2, stochastic=True)
+        pred = AttnPredictor(dim=dim, hidden=phid, n_blocks=pb, stochastic=True)
     else:
         pred = make_predictor(pred_kind, dim=dim)
     pred.load_state_dict(blob["predictor_state"]); pred.eval()
     act_embed = nn.Embedding(4, dim)
     act_embed.load_state_dict(blob["action_embed_state"]); act_embed.eval()
+
+    vq_K = cfg.get("vq_K", 0)
+    vq = None
+    if vq_K > 0 and "vq_state" in blob:
+        vq = SpatialVQ(dim=dim, K=vq_K)
+        vq.load_state_dict(blob["vq_state"]); vq.eval()
+        vq = vq.to(args.device)
 
     enc = enc.to(args.device); dec = dec.to(args.device)
     pred = pred.to(args.device); act_embed = act_embed.to(args.device)
@@ -266,6 +281,8 @@ def run_arch_jepa_play(args, ckpt_path):
         with torch.no_grad():
             a_t = act_embed(torch.tensor([current_action], device=args.device))  # (1, dim)
             z = pred(z, a_t)                                                       # roll latent
+            if vq is not None:
+                z, _ = vq(z)                                                       # snap to discrete code
             raw = dec(z)
             recon = render_oracle_output(raw, "cat-kmeans-unique", K=K, palette=palette).clamp(0, 1)[0]
 

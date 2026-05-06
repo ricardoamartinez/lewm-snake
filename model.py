@@ -224,19 +224,32 @@ class OracleEncoder(nn.Module):
 
 
 class OracleEncoderCNN(nn.Module):
-    """CNN encoder: spatial state mask (4, 64, 64) -> 128-d latent.
-    Translation-equivariant — preserves cell precision exactly through the
-    convolutional pipeline."""
-    def __init__(self, in_channels: int = 4, out_dim: int = 128):
+    """CNN encoder: spatial state mask (C, 64, 64) -> latent."""
+    def __init__(self, in_channels: int = 4, out_dim: int = 128, deep: bool = False):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(in_channels, 32, 4, 2, 1), nn.GELU(),    # 64 -> 32
-            nn.Conv2d(32, 64, 4, 2, 1),          nn.GELU(),    # 32 -> 16
-            nn.Conv2d(64, 128, 4, 2, 1),         nn.GELU(),    # 16 -> 8
-            nn.Conv2d(128, 128, 4, 2, 1),        nn.GELU(),    # 8 -> 4
-            nn.Flatten(),
-            nn.Linear(128 * 4 * 4, out_dim),
-        )
+        if deep:
+            ch = 64
+            self.net = nn.Sequential(
+                nn.Conv2d(in_channels, ch, 3, 1, 1), nn.GroupNorm(8, ch), nn.GELU(),
+                nn.Conv2d(ch, ch, 3, 1, 1),          nn.GroupNorm(8, ch), nn.GELU(),
+                nn.Conv2d(ch, ch * 2, 4, 2, 1),      nn.GroupNorm(8, ch * 2), nn.GELU(),  # 32
+                nn.Conv2d(ch * 2, ch * 2, 3, 1, 1),  nn.GroupNorm(8, ch * 2), nn.GELU(),
+                nn.Conv2d(ch * 2, ch * 4, 4, 2, 1),  nn.GroupNorm(8, ch * 4), nn.GELU(),  # 16
+                nn.Conv2d(ch * 4, ch * 4, 3, 1, 1),  nn.GroupNorm(8, ch * 4), nn.GELU(),
+                nn.Conv2d(ch * 4, ch * 4, 4, 2, 1),  nn.GroupNorm(8, ch * 4), nn.GELU(),  # 8
+                nn.Conv2d(ch * 4, ch * 4, 4, 2, 1),  nn.GroupNorm(8, ch * 4), nn.GELU(),  # 4
+                nn.Flatten(),
+                nn.Linear(ch * 4 * 4 * 4, out_dim),
+            )
+        else:
+            self.net = nn.Sequential(
+                nn.Conv2d(in_channels, 32, 4, 2, 1), nn.GELU(),    # 64 -> 32
+                nn.Conv2d(32, 64, 4, 2, 1),          nn.GELU(),    # 32 -> 16
+                nn.Conv2d(64, 128, 4, 2, 1),         nn.GELU(),    # 16 -> 8
+                nn.Conv2d(128, 128, 4, 2, 1),        nn.GELU(),    # 8 -> 4
+                nn.Flatten(),
+                nn.Linear(128 * 4 * 4, out_dim),
+            )
 
     def forward(self, state):
         return self.net(state)

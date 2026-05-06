@@ -130,6 +130,28 @@ def _sinusoidal(x, n_freqs=8):
     return np.array(out, dtype=np.float32)
 
 
+def _state_sinusoidal(env, head_y, head_x, food_y, food_x, n_freqs=8):
+    feats = []
+    n = 2 * n_freqs
+    for v in (head_y / GRID, head_x / GRID, food_y / GRID, food_x / GRID):
+        feats.append(_sinusoidal(v, n_freqs=n_freqs))
+    feats.append(np.array([len(env.body) / 50.0], dtype=np.float32))
+    for i in range(30):
+        if i + 1 < len(env.body):
+            y, x = env.body[i + 1]
+            feats.append(_sinusoidal(y / GRID, n_freqs=n_freqs))
+            feats.append(_sinusoidal(x / GRID, n_freqs=n_freqs))
+            feats.append(np.array([1.0], dtype=np.float32))
+        else:
+            feats.append(np.zeros(n, dtype=np.float32))
+            feats.append(np.zeros(n, dtype=np.float32))
+            feats.append(np.array([0.0], dtype=np.float32))
+    d = np.zeros(4, dtype=np.float32)
+    d[env.dir] = 1.0
+    feats.append(d)
+    return np.concatenate(feats)
+
+
 def state_features_v2(env, encoding="baseline"):
     """Multiple state-encoding variants for the precision ablation.
     Returns a 1-D float vector of variable length OR a 4x64x64 spatial mask
@@ -164,24 +186,9 @@ def state_features_v2(env, encoding="baseline"):
         return np.concatenate(feats)
 
     if encoding == "sinusoidal":
-        feats = []
-        for v in (head_y / GRID, head_x / GRID, food_y / GRID, food_x / GRID):
-            feats.append(_sinusoidal(v))
-        feats.append(np.array([len(env.body) / 50.0], dtype=np.float32))
-        for i in range(30):
-            if i + 1 < len(env.body):
-                y, x = env.body[i + 1]
-                feats.append(_sinusoidal(y / GRID))
-                feats.append(_sinusoidal(x / GRID))
-                feats.append(np.array([1.0], dtype=np.float32))
-            else:
-                feats.append(np.zeros(16, dtype=np.float32))
-                feats.append(np.zeros(16, dtype=np.float32))
-                feats.append(np.array([0.0], dtype=np.float32))
-        d = np.zeros(4, dtype=np.float32)
-        d[env.dir] = 1.0
-        feats.append(d)
-        return np.concatenate(feats)
+        return _state_sinusoidal(env, head_y, head_x, food_y, food_x, n_freqs=8)
+    if encoding == "sinusoidal-K32":
+        return _state_sinusoidal(env, head_y, head_x, food_y, food_x, n_freqs=32)
 
     if encoding == "spatial":
         # 4-channel binary mask: [head, body, food, empty]

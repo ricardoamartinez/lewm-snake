@@ -116,7 +116,8 @@ def load_oracle(ckpt_path):
     cfg = blob["cfg"]
     if cfg.get("state_encoding") == "spatial":
         in_ch = cfg.get("state_shape", [4, 64, 64])[0]
-        enc = OracleEncoderCNN(in_channels=in_ch, out_dim=cfg["dim"])
+        enc = OracleEncoderCNN(in_channels=in_ch, out_dim=cfg["dim"],
+                                deep=cfg.get("deep_cnn", False))
     else:
         enc = OracleEncoder(in_dim=cfg.get("state_dim", 99), out_dim=cfg["dim"])
     enc.load_state_dict(blob["encoder_state"])

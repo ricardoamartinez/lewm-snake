@@ -67,6 +67,17 @@ PRECISION_RUNS = [
     ("pos-pixshuf",    "baseline",   "pixshuf"),
 ]
 
+# Pinpoint ablation: same loss + dim=16 latent, vary one axis
+PINPOINT_RUNS = [
+    # (run_name, state_encoding, decoder_kind, freq_K, deep_cnn)
+    ("pin-baseline",      "sinusoidal", "convt",   8,  False),
+    ("pin-K32freq",       "sinusoidal", "convt",   32, False),
+    ("pin-pixshuf",       "sinusoidal", "pixshuf", 8,  False),
+    ("pin-spatial",       "spatial",    "convt",   8,  False),
+    ("pin-spatial-deep",  "spatial",    "convt",   8,  True),
+]
+PINPOINT_DIM = 16
+
 
 @app.function(
     image=image,
@@ -80,6 +91,7 @@ def train_oracle(
     K: int = None,
     run_name_override: str = None,
     state_encoding: str = "baseline",
+    deep_cnn: bool = False,
     epochs: int = 20,
     batch: int = 256,
     lr: float = 1e-3,
@@ -162,7 +174,7 @@ def train_oracle(
     )
 
     if state_encoding == "spatial":
-        enc = OracleEncoderCNN(in_channels=states.shape[1], out_dim=dim).to(device)
+        enc = OracleEncoderCNN(in_channels=states.shape[1], out_dim=dim, deep=deep_cnn).to(device)
     else:
         enc = OracleEncoder(in_dim=states.shape[1], out_dim=dim).to(device)
 
@@ -194,6 +206,7 @@ def train_oracle(
         state_dim=states.shape[1] if states.ndim == 2 else None,
         state_encoding=state_encoding,
         state_shape=list(states.shape[1:]),
+        deep_cnn=deep_cnn,
     )
     if palette is not None:
         cfg["palette_K"] = palette.shape[0]
@@ -355,14 +368,20 @@ def _make_perpixel(dim, out_channels, img_size=64, hidden=256):
 
 @app.local_entrypoint()
 def main():
-    print(f"Spawning {len(PRECISION_RUNS)} parallel H100 jobs (precision ablation) ...")
-    for run_name, state_enc, dec_kind in PRECISION_RUNS:
+    print(f"Spawning {len(PINPOINT_RUNS)} parallel H100 jobs (pinpoint ablation, dim={PINPOINT_DIM}) ...")
+    for run_name, state_enc, dec_kind, freq_K, deep in PINPOINT_RUNS:
+        # `freq_K` selects which sinusoidal encoding to use
+        actual_state_enc = state_enc
+        if state_enc == "sinusoidal" and freq_K == 32:
+            actual_state_enc = "sinusoidal-K32"
         h = train_oracle.spawn(
             decoder_kind=dec_kind,
             loss_kind="cat-kmeans-unique",
             K=8,
             run_name_override=run_name,
-            state_encoding=state_enc,
+            state_encoding=actual_state_enc,
+            deep_cnn=deep,
+            dim=PINPOINT_DIM,
         )
-        print(f"  spawned {run_name} (state={state_enc}, decoder={dec_kind}): {h.object_id}")
+        print(f"  spawned {run_name} (state={actual_state_enc}, dec={dec_kind}, deep={deep}, dim={PINPOINT_DIM}): {h.object_id}")
     print("All jobs spawned and detached. Local entrypoint exiting; jobs continue on Modal.")

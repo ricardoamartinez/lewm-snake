@@ -403,21 +403,25 @@ def train_arch_jepa(
         drop_last=True, pin_memory=True, persistent_workers=True,
     )
 
-    # Build architecture
+    # Build architecture. Parse "spatial-LAT[-deep][-bigCh]" patterns.
     is_spatial = arch_kind.startswith("spatial")
     pred_kind = "conv" if is_spatial else "mlp"
     if arch_kind == "flat":
         enc = OracleEncoderCNN(in_channels=3, out_dim=dim).to(device)
         dec = TinyDecoder(dim=dim, ch=128, out_channels=out_channels).to(device)
-    elif arch_kind == "spatial-16":
-        enc = SpatialEncoder(in_channels=3, dim=dim, lat_size=16).to(device)
-        dec = SpatialDecoder(dim=dim, out_channels=out_channels, lat_size=16).to(device)
-    elif arch_kind == "spatial-8":
-        enc = SpatialEncoder(in_channels=3, dim=dim, lat_size=8).to(device)
-        dec = SpatialDecoder(dim=dim, out_channels=out_channels, lat_size=8).to(device)
-    elif arch_kind == "spatial-4":
-        enc = SpatialEncoder(in_channels=3, dim=dim, lat_size=4).to(device)
-        dec = SpatialDecoder(dim=dim, out_channels=out_channels, lat_size=4).to(device)
+    elif is_spatial:
+        parts = arch_kind.split("-")          # ["spatial", "16"] or ["spatial", "32", "deep"] etc.
+        lat_size = int(parts[1])
+        deep = "deep" in parts
+        bigch = "bigCh" in parts
+        enc_refine = 3 if deep else 1
+        dec_refine = 3 if deep else 1
+        enc_base = 64 if bigch else 32
+        dec_base = 256 if bigch else 128
+        enc = SpatialEncoder(in_channels=3, dim=dim, lat_size=lat_size,
+                             base_ch=enc_base, refine_blocks=enc_refine).to(device)
+        dec = SpatialDecoder(dim=dim, out_channels=out_channels, lat_size=lat_size,
+                             base_ch=dec_base, refine_blocks=dec_refine).to(device)
     else:
         raise ValueError(arch_kind)
 
@@ -517,17 +521,16 @@ def train_arch_jepa(
     print(f"[{run_name}] DONE in {time.time()-train_t0:.0f}s", flush=True)
 
 
-# JEPA architecture ablation v2: pred_loss was 140x bigger than dec_loss with
-# unscaled MSE on 16-d latents. Drop pred_lambda to ~0 so dec gradient (via rollout)
-# trains everything end-to-end. Predictor still evolves latent under action via
-# the rollout chain — gradient just comes purely from pixel reconstruction.
+# Precision ablation: spatial-16 best so far but 4x4 px blocks (blob renders).
+# Push for pixel precision via finer latents and deeper enc/dec.
+# All pred_lambda=0, rollout dec_loss only.
 ARCH_RUNS = [
-    # (run_name,                arch_kind,    pred_lambda)
-    ("jepa2-flat-pl0",          "flat",        0.0),
-    ("jepa2-spatial-16-pl0",    "spatial-16",  0.0),
-    ("jepa2-spatial-8-pl0",     "spatial-8",   0.0),
-    ("jepa2-spatial-4-pl0",     "spatial-4",   0.0),
-    ("jepa2-spatial-16-pl001",  "spatial-16",  0.01),  # tiny aux pred loss
+    # (run_name,                 arch_kind)
+    ("prec-spatial-16",          "spatial-16"),         # control (current best)
+    ("prec-spatial-32",          "spatial-32"),         # 2x2 px per cell
+    ("prec-spatial-64",          "spatial-64"),         # 1 px per cell — pixel-perfect
+    ("prec-spatial-32-deep",     "spatial-32-deep"),    # finer + 3 refine blocks each
+    ("prec-spatial-16-deep",     "spatial-16-deep"),    # control + deeper enc/dec
 ]
 
 
@@ -1375,13 +1378,13 @@ def train_manifold(
 
 @app.local_entrypoint()
 def main():
-    print(f"Spawning {len(ARCH_RUNS)} parallel A10G jobs (JEPA arch v2: pred_lambda~0) ...")
-    for run_name, arch_kind, pl in ARCH_RUNS:
+    print(f"Spawning {len(ARCH_RUNS)} parallel A10G jobs (precision: finer latents + deeper) ...")
+    for run_name, arch_kind in ARCH_RUNS:
         h = train_arch_jepa.spawn(
             run_name=run_name, arch_kind=arch_kind,
-            rollout_dec=True, pred_lambda=pl,
+            rollout_dec=True, pred_lambda=0.0,
         )
-        print(f"  spawned {run_name} ({arch_kind}, pred_lambda={pl}): {h.object_id}")
+        print(f"  spawned {run_name} ({arch_kind}): {h.object_id}")
     print("All jobs spawned.")
     return
     # legacy entrypoint below

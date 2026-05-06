@@ -477,26 +477,37 @@ class SpatialEncoder(nn.Module):
     Each spatial cell of the latent corresponds to a local region of input pixels,
     so positional information is preserved naturally.
     """
-    def __init__(self, in_channels=3, dim=16, lat_size=16, base_ch=32):
+    def __init__(self, in_channels=3, dim=16, lat_size=16, base_ch=32, refine_blocks=1):
         super().__init__()
         ladder = {64: 0, 32: 1, 16: 2, 8: 3, 4: 4}
         n_down = ladder[lat_size]
         layers = []
-        c_in = in_channels
-        c = base_ch
-        for i in range(n_down):
-            c_out = min(base_ch * (2 ** i), 256)
+        if n_down == 0:
+            # No downsampling: lift channels at full resolution
             layers += [
-                nn.Conv2d(c_in, c_out, 4, 2, 1),
-                nn.GroupNorm(min(8, c_out), c_out), nn.GELU(),
+                nn.Conv2d(in_channels, base_ch, 3, 1, 1),
+                nn.GroupNorm(min(8, base_ch), base_ch), nn.GELU(),
+                nn.Conv2d(base_ch, base_ch * 2, 3, 1, 1),
+                nn.GroupNorm(min(8, base_ch * 2), base_ch * 2), nn.GELU(),
             ]
-            c_in = c_out
-            c = c_out
-        layers += [
-            nn.Conv2d(c, c, 3, 1, 1),
-            nn.GroupNorm(min(8, c), c), nn.GELU(),
-            nn.Conv2d(c, dim, 1),
-        ]
+            c = base_ch * 2
+        else:
+            c_in = in_channels
+            c = base_ch
+            for i in range(n_down):
+                c_out = min(base_ch * (2 ** i), 256)
+                layers += [
+                    nn.Conv2d(c_in, c_out, 4, 2, 1),
+                    nn.GroupNorm(min(8, c_out), c_out), nn.GELU(),
+                ]
+                c_in = c_out
+                c = c_out
+        for _ in range(refine_blocks):
+            layers += [
+                nn.Conv2d(c, c, 3, 1, 1),
+                nn.GroupNorm(min(8, c), c), nn.GELU(),
+            ]
+        layers.append(nn.Conv2d(c, dim, 1))
         self.net = nn.Sequential(*layers)
         self.lat_size = lat_size
 
@@ -509,7 +520,7 @@ class SpatialDecoder(nn.Module):
 
     Produces (B, out_channels, 64, 64). No FC layer — spatial info preserved.
     """
-    def __init__(self, dim=16, out_channels=8, lat_size=16, base_ch=128):
+    def __init__(self, dim=16, out_channels=8, lat_size=16, base_ch=128, refine_blocks=1):
         super().__init__()
         ladder = {64: 0, 32: 1, 16: 2, 8: 3, 4: 4}
         n_up = ladder[lat_size]
@@ -520,17 +531,17 @@ class SpatialDecoder(nn.Module):
         c = base_ch
         for i in range(n_up):
             c_next = max(base_ch // (2 ** (i + 1)), 32)
-            is_last = (i == n_up - 1)
             layers += [
                 nn.ConvTranspose2d(c, c_next, 4, 2, 1),
                 nn.GroupNorm(min(8, c_next), c_next), nn.SiLU(),
             ]
             c = c_next
-        layers += [
-            nn.Conv2d(c, c, 3, 1, 1),
-            nn.GroupNorm(min(8, c), c), nn.SiLU(),
-            nn.Conv2d(c, out_channels, 1),
-        ]
+        for _ in range(refine_blocks):
+            layers += [
+                nn.Conv2d(c, c, 3, 1, 1),
+                nn.GroupNorm(min(8, c), c), nn.SiLU(),
+            ]
+        layers.append(nn.Conv2d(c, out_channels, 1))
         self.net = nn.Sequential(*layers)
         self.lat_size = lat_size
 

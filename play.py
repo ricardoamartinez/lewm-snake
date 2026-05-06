@@ -162,17 +162,19 @@ def run_arch_jepa_play(args, ckpt_path):
     if arch == "flat":
         enc = OracleEncoderCNN(in_channels=3, out_dim=dim)
         dec = TinyDecoder(dim=dim, ch=128, out_channels=out_channels)
-    elif arch == "spatial-16":
-        enc = SpatialEncoder(in_channels=3, dim=dim, lat_size=16)
-        dec = SpatialDecoder(dim=dim, out_channels=out_channels, lat_size=16)
-    elif arch == "spatial-8":
-        enc = SpatialEncoder(in_channels=3, dim=dim, lat_size=8)
-        dec = SpatialDecoder(dim=dim, out_channels=out_channels, lat_size=8)
-    elif arch == "spatial-4":
-        enc = SpatialEncoder(in_channels=3, dim=dim, lat_size=4)
-        dec = SpatialDecoder(dim=dim, out_channels=out_channels, lat_size=4)
     else:
-        raise ValueError(arch)
+        parts = arch.split("-")
+        lat_size = int(parts[1])
+        deep = "deep" in parts
+        bigch = "bigCh" in parts
+        enc_refine = 3 if deep else 1
+        dec_refine = 3 if deep else 1
+        enc_base = 64 if bigch else 32
+        dec_base = 256 if bigch else 128
+        enc = SpatialEncoder(in_channels=3, dim=dim, lat_size=lat_size,
+                             base_ch=enc_base, refine_blocks=enc_refine)
+        dec = SpatialDecoder(dim=dim, out_channels=out_channels, lat_size=lat_size,
+                             base_ch=dec_base, refine_blocks=dec_refine)
     enc.load_state_dict(blob["encoder_state"]); enc.eval()
     dec.load_state_dict(blob["decoder_state"]); dec.eval()
     pred = make_predictor(pred_kind, dim=dim)

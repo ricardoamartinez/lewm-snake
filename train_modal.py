@@ -325,12 +325,13 @@ def train_predictor(
 
 # Pinpoint ablation: same loss + dim=16 latent, vary one axis
 FULL_SYSTEM_RUNS = [
-    # (run_name, predictor_kind, dec_noise, multi_step)
-    ("full-mlp",          "mlp",       0.0, 1),
-    ("full-residual",     "residual",  0.0, 1),
-    ("full-multistep",    "mlp",       0.0, 4),
-    ("full-decnoise",     "mlp",       0.3, 1),
-    ("full-kitchensink",  "residual",  0.3, 4),
+    # (run_name, predictor_kind, dec_noise, multi_step, dec_grad)
+    # All variants use dec_grad=True so encoder is forced to encode pixel content
+    ("full-mlp-dg",            "mlp",       0.0, 1, True),
+    ("full-residual-dg",       "residual",  0.0, 1, True),
+    ("full-multistep-dg",      "mlp",       0.0, 4, True),
+    ("full-decnoise-dg",       "mlp",       0.3, 1, True),
+    ("full-kitchensink-dg",    "residual",  0.3, 4, True),
 ]
 
 
@@ -345,6 +346,7 @@ def train_full(
     predictor_kind: str,
     dec_noise: float,
     multi_step: int,
+    dec_grad: bool = True,
     epochs: int = 25,
     batch: int = 256,
     lr: float = 5e-4,
@@ -434,6 +436,7 @@ def train_full(
     cfg = dict(
         run_name=run_name, mode="full", encoder_kind="pixel-cnn",
         predictor_kind=predictor_kind, dec_noise=dec_noise, multi_step=multi_step,
+        dec_grad=dec_grad,
         history=history, pred_horizon=pred_horizon, dim=dim,
         K=K_PALETTE, out_channels=out_channels, decoder_kind="convt",
         num_episodes=num_episodes, batch=batch, epochs=epochs,
@@ -472,8 +475,9 @@ def train_full(
                 # SIGReg on the encoder output (T, B, D)
                 sigreg_loss = sigreg(emb.transpose(0, 1))
 
-                # Decoder loss with optional noise injection (latent stop-grad → decoder is post-hoc)
-                z_flat = emb.detach().reshape(B * T_, dim)
+                # Decoder loss — dec_grad controls whether decoder loss reaches encoder
+                z_for_dec = emb if dec_grad else emb.detach()
+                z_flat = z_for_dec.reshape(B * T_, dim)
                 if dec_noise > 0:
                     z_flat = z_flat + dec_noise * torch.randn_like(z_flat)
                 raw = dec(z_flat)
@@ -1124,13 +1128,14 @@ def train_manifold(
 
 @app.local_entrypoint()
 def main():
-    print(f"Spawning {len(FULL_SYSTEM_RUNS)} parallel A10G jobs (FULL SYSTEM) ...")
-    for run_name, pred_kind, dn, mstep in FULL_SYSTEM_RUNS:
+    print(f"Spawning {len(FULL_SYSTEM_RUNS)} parallel A10G jobs (FULL SYSTEM, dec_grad=True) ...")
+    for run_name, pred_kind, dn, mstep, dg in FULL_SYSTEM_RUNS:
         h = train_full.spawn(
             run_name=run_name,
             predictor_kind=pred_kind,
             dec_noise=dn,
             multi_step=mstep,
+            dec_grad=dg,
         )
         print(f"  spawned {run_name}: {h.object_id}")
     print("All jobs spawned.")

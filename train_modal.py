@@ -606,9 +606,11 @@ def train_arch_jepa(
             torch.nn.utils.clip_grad_norm_(params, 1.0)
             opt.step(); sched.step()
 
-            # Update priorities
+            # Update priorities (sanitize NaN/inf to baseline value 1.0)
             if hard_mining in ("prio",):
-                priorities[update_idx] = update_loss.float().cpu().double()
+                ul = update_loss.float().cpu().double()
+                ul = torch.nan_to_num(ul, nan=1.0, posinf=1.0, neginf=1.0)
+                priorities[update_idx] = ul
 
             total["loss"] += loss.item()
             total["pred"] += pred_loss.item()

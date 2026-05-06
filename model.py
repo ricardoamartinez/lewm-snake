@@ -283,6 +283,7 @@ class SpatialVQ(nn.Module):
     Breaks the "averaging across plausible futures" failure mode — predicted
     latents are snapped to discrete codes, so even averaged predictions
     deterministically pick ONE code rather than render the mean.
+    All VQ ops run in fp32 to avoid bf16 EMA instability.
     """
     def __init__(self, dim: int, K: int = 512):
         super().__init__()
@@ -290,11 +291,11 @@ class SpatialVQ(nn.Module):
 
     def forward(self, z):
         # z: (B, dim, H, W) -> (B, dim, H, W) (quantized)
-        B, D, H, W = z.shape
-        z_perm = z.permute(0, 2, 3, 1).contiguous()                        # (B, H, W, dim)
+        in_dtype = z.dtype
+        z_perm = z.permute(0, 2, 3, 1).contiguous().float()                # (B, H, W, dim) fp32
         z_q, commit, _idx = self.vq(z_perm)
-        z_q = z_q.permute(0, 3, 1, 2).contiguous()
-        return z_q, commit
+        z_q = z_q.permute(0, 3, 1, 2).contiguous().to(in_dtype)
+        return z_q, commit.to(in_dtype)
 
 
 def make_quantizer(kind: str, dim: int):

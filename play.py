@@ -270,7 +270,7 @@ def run_predictor_play(args, ckpt_path):
         real_surf = pygame.surfarray.make_surface(real_frame.swapaxes(0, 1))
         real_surf = pygame.transform.scale(real_surf, (cell, cell))
         screen.blit(real_surf, (0, 0))
-        rec_arr = (recon.cpu().numpy().transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
+        rec_arr = (recon.cpu().numpy().transpose(1, 2, 0) * 255).clip(0, 255).round().astype(np.uint8)
         rec_surf = pygame.surfarray.make_surface(rec_arr.swapaxes(0, 1))
         rec_surf = pygame.transform.scale(rec_surf, (cell, cell))
         screen.blit(rec_surf, (cell + 8, 0))
@@ -354,7 +354,7 @@ def run_oracle_replay(args, ckpt_path):
         real_surf = pygame.surfarray.make_surface(real_arr.swapaxes(0, 1))
         real_surf = pygame.transform.scale(real_surf, (cell, cell))
         screen.blit(real_surf, (0, 0))
-        rec_arr = (recon.cpu().numpy().transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
+        rec_arr = (recon.cpu().numpy().transpose(1, 2, 0) * 255).clip(0, 255).round().astype(np.uint8)
         rec_surf = pygame.surfarray.make_surface(rec_arr.swapaxes(0, 1))
         rec_surf = pygame.transform.scale(rec_surf, (cell, cell))
         screen.blit(rec_surf, (cell + 8, 0))
@@ -460,7 +460,7 @@ def main():
     current_action = 3
 
     def render_frame(frame_tensor):
-        arr = (frame_tensor.detach().cpu().numpy().transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
+        arr = (frame_tensor.detach().cpu().numpy().transpose(1, 2, 0) * 255).clip(0, 255).round().astype(np.uint8)
         surf = pygame.surfarray.make_surface(arr.swapaxes(0, 1))
         surf = pygame.transform.scale(surf, (W, HH))
         screen.blit(surf, (0, 0))

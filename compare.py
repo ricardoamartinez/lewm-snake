@@ -81,8 +81,8 @@ def main():
     canvas[:] = 30
     for i in range(n):
         x0 = i * (cell + 2)
-        a = (real_arr[i] * 255).astype(np.uint8)
-        b = (imagined_arr[i] * 255).clip(0, 255).astype(np.uint8)
+        a = (real_arr[i] * 255).round().astype(np.uint8)
+        b = (imagined_arr[i] * 255).clip(0, 255).round().astype(np.uint8)
         a_im = Image.fromarray(a).resize((cell, cell), Image.NEAREST)
         b_im = Image.fromarray(b).resize((cell, cell), Image.NEAREST)
         canvas[:cell, x0:x0 + cell] = np.array(a_im)

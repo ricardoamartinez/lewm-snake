@@ -829,6 +829,7 @@ def _build_arch_jepa_model(blob, device):
     from model import (
         OracleEncoderCNN, TinyDecoder, SpatialEncoder, SpatialDecoder, SpatialPixShufDecoder,
         ConvPredictor, StochasticConvPredictor, GlobalConvPredictor, AttnPredictor,
+        VariationalConvPredictor,
         SpatialVQ, SpatialFSQ, make_predictor,
     )
     cfg = blob["cfg"]
@@ -925,6 +926,27 @@ def _viz_latent_rgb(z, out_size=64):
     return v.clamp(0, 1)
 
 
+def _compute_class_counts(palette, grid_cells, n_frames=20):
+    """Sample fresh game frames, count avg pixels per palette class.
+    Used to cap per-class rendering at play time (no hardcoding)."""
+    from snake import Snake
+    env = Snake(seed=0, grid_cells=grid_cells)
+    frames = [env.render()]
+    for _ in range(n_frames - 1):
+        f, d = env.step(env.dir)
+        frames.append(f)
+        if d:
+            env = Snake(seed=int(time.time()) & 0xFFFF, grid_cells=grid_cells)
+            frames.append(env.render())
+    pix = torch.from_numpy(np.stack(frames)).float() / 255.0                 # (N, H, W, 3)
+    pal = palette.view(1, palette.size(0), 1, 1, 3)
+    dist = (pix.unsqueeze(1) - pal).pow(2).sum(dim=-1)                       # (N, K, H, W)
+    labels = dist.argmin(dim=1)                                               # (N, H, W)
+    counts = torch.bincount(labels.flatten(), minlength=palette.size(0)).float()
+    avg = counts / len(frames)
+    return avg.round().long()                                                  # (K,) avg per-frame
+
+
 def run_combo_play(args):
     """Open ONE window with GT | ENC | DEC | JEPA per run, stacked vertically.
     Each row is a separate run with its own grid_cells / model.
@@ -932,7 +954,7 @@ def run_combo_play(args):
     """
     import pygame
     from snake import Snake
-    from model import render_oracle_output
+    from model import render_oracle_output, render_topk_per_class
 
     run_names = [r.strip() for r in args.runs.split(",") if r.strip()]
     name = f"epoch_{args.epoch:03d}.pt" if args.epoch else "latest.pt"
@@ -950,12 +972,15 @@ def run_combo_play(args):
         m = _build_arch_jepa_model(blob, args.device)
         gc = m["cfg"].get("grid_cells", 64)
         env = Snake(seed=int(time.time()) & 0xFFFF, grid_cells=gc)
+        # Per-class pixel count prior (auto-derived from this game's data distribution)
+        class_counts = _compute_class_counts(m["palette"], gc).to(args.device)
+        print(f"  {rn}: class_counts={class_counts.tolist()}")
         # Seed JEPA latent
         seed_frame = env.render()
         f0 = torch.from_numpy(seed_frame).float().permute(2, 0, 1).unsqueeze(0).to(args.device) / 255.0
         with torch.no_grad():
             z0 = m["enc"](f0)
-        rows.append(dict(run=rn, model=m, env=env, z=z0, grid_cells=gc))
+        rows.append(dict(run=rn, model=m, env=env, z=z0, grid_cells=gc, class_counts=class_counts))
 
     if not rows:
         print("[combo] no valid runs")
@@ -1045,8 +1070,7 @@ def run_combo_play(args):
                 else:
                     z_enc_q = z_enc
                 raw_dec = m["dec"](z_enc_q)
-                recon_dec = render_oracle_output(raw_dec, "cat-kmeans-unique",
-                                                  K=m["K"], palette=m["palette"]).clamp(0, 1)[0]
+                recon_dec = render_topk_per_class(raw_dec, m["palette"], r["class_counts"]).clamp(0, 1)[0]
                 a_t = m["act_embed"](torch.tensor([current_action], device=args.device))
                 pred_out = m["pred"](r["z"], a_t)
                 z_new = pred_out[0] if isinstance(pred_out, tuple) else pred_out
@@ -1054,8 +1078,7 @@ def run_combo_play(args):
                     z_new, _ = m["vq"](z_new)
                 r["z"] = z_new
                 raw_jepa = m["dec"](z_new)
-                recon_jepa = render_oracle_output(raw_jepa, "cat-kmeans-unique",
-                                                   K=m["K"], palette=m["palette"]).clamp(0, 1)[0]
+                recon_jepa = render_topk_per_class(raw_jepa, m["palette"], r["class_counts"]).clamp(0, 1)[0]
                 enc_viz = _viz_latent_rgb(z_enc, out_size=64)
 
             def blit_pane(frame_chw_or_hwc, col):

@@ -1053,6 +1053,51 @@ def quantize_to_class(pixels):
     return dist.argmin(dim=-3)            # (..., H, W)
 
 
+def render_topk_per_class(raw, palette, class_counts):
+    """Render by capping each class to its expected pixel count from training data.
+    Eliminates "food everywhere" / "body everywhere" hallucinations without per-game
+    hardcoding — class_counts are auto-derived from the data distribution.
+
+    raw: (B, K_logits, H, W)
+    palette: (K_pal, 3)
+    class_counts: (K_pal,) integer pixel-count budget per class
+
+    Algorithm: most-frequent class fills the canvas; for each rarer class c, keep
+    only the top class_counts[c] highest-probability pixels (those override BG).
+    Conflicts (a pixel claimed by two classes) resolve to the class with higher
+    prob at that pixel.
+    """
+    B, _, H, W = raw.shape
+    K_pal = palette.size(0)
+    pal = palette.to(raw.device, dtype=raw.dtype)
+    log_probs = F.log_softmax(raw, dim=1)                                 # (B, K, H, W)
+    bg_class = int(torch.as_tensor(class_counts).argmax().item())
+    # Each pixel: best non-BG class and its prob
+    nonbg_log = log_probs.clone()
+    nonbg_log[:, bg_class] = float("-inf")
+    best_nonbg_prob, best_nonbg_class = nonbg_log[:, :K_pal].max(dim=1)    # (B, H, W)
+    # Initialize all pixels to BG
+    out_class = torch.full((B, H, W), bg_class, device=raw.device, dtype=torch.long)
+    # For each non-BG class c, find its top-N pixels (where N = class_counts[c]).
+    # Conflict resolution: a pixel chosen by class c gets c only if its log-prob for c
+    # is above its log-prob for any already-assigned class.
+    cur_prob = torch.full((B, H, W), float("-inf"), device=raw.device, dtype=raw.dtype)
+    for c in range(K_pal):
+        if c == bg_class:
+            continue
+        n = max(1, int(torch.as_tensor(class_counts)[c].item()))
+        probs_c = log_probs[:, c].reshape(B, -1)
+        topk = probs_c.topk(min(n, probs_c.size(1)), dim=1).indices         # (B, n)
+        for b in range(B):
+            ys = (topk[b] // W).long()
+            xs = (topk[b] % W).long()
+            mask = log_probs[b, c, ys, xs] > cur_prob[b, ys, xs]
+            ys_sel = ys[mask]; xs_sel = xs[mask]
+            out_class[b, ys_sel, xs_sel] = c
+            cur_prob[b, ys_sel, xs_sel] = log_probs[b, c, ys_sel, xs_sel]
+    return pal[out_class].permute(0, 3, 1, 2)
+
+
 def render_decoder_output(raw, loss_kind):
     """Convert raw decoder output to RGB in [0,1] for visualisation."""
     if loss_kind in ("mse", "focal-mse"):

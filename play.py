@@ -1070,7 +1070,11 @@ def run_combo_play(args):
                 else:
                     z_enc_q = z_enc
                 raw_dec = m["dec"](z_enc_q)
-                recon_dec = render_topk_per_class(raw_dec, m["palette"], r["class_counts"]).clamp(0, 1)[0]
+                if getattr(args, "cap_classes", False):
+                    recon_dec = render_topk_per_class(raw_dec, m["palette"], r["class_counts"]).clamp(0, 1)[0]
+                else:
+                    recon_dec = render_oracle_output(raw_dec, "cat-kmeans-unique",
+                                                      K=m["K"], palette=m["palette"]).clamp(0, 1)[0]
                 a_t = m["act_embed"](torch.tensor([current_action], device=args.device))
                 pred_out = m["pred"](r["z"], a_t)
                 z_new = pred_out[0] if isinstance(pred_out, tuple) else pred_out
@@ -1078,7 +1082,11 @@ def run_combo_play(args):
                     z_new, _ = m["vq"](z_new)
                 r["z"] = z_new
                 raw_jepa = m["dec"](z_new)
-                recon_jepa = render_topk_per_class(raw_jepa, m["palette"], r["class_counts"]).clamp(0, 1)[0]
+                if getattr(args, "cap_classes", False):
+                    recon_jepa = render_topk_per_class(raw_jepa, m["palette"], r["class_counts"]).clamp(0, 1)[0]
+                else:
+                    recon_jepa = render_oracle_output(raw_jepa, "cat-kmeans-unique",
+                                                      K=m["K"], palette=m["palette"]).clamp(0, 1)[0]
                 enc_viz = _viz_latent_rgb(z_enc, out_size=64)
 
             def blit_pane(frame_chw_or_hwc, col):
@@ -1140,6 +1148,9 @@ def main():
     ap.add_argument("--run", default=None, help="experiment subdir under volume root")
     ap.add_argument("--runs", default=None,
                     help="comma-separated run names — opens combo window with GT|ENC|DEC|JEPA per run")
+    ap.add_argument("--cap-classes", action="store_true",
+                    help="cap each rendered class to its data prior (top-K-per-class). Off by default — "
+                         "use argmax to see raw model output.")
     args = ap.parse_args()
 
     if args.runs:

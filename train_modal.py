@@ -358,6 +358,7 @@ def train_arch_jepa(
     fsq_levels: int = 0,            # if > 0, apply FSQ with L levels per dim (more stable than VQ)
     grid_cells: int = 64,           # snake game grid (16 = chunky 4px cells, 64 = 1px cells)
     kl_lambda: float = 0.0,         # variational KL weight (only used with variational predictor)
+    k_samples: int = 1,             # best-of-K: do K stochastic rollouts, train on min(loss). Forces commit.
 ):
     """Full JEPA system with spatial latent: encoder + ConvPredictor + decoder.
     Trains on T-step windows with both pred MSE in latent space and dec CE in pixel space.
@@ -513,20 +514,9 @@ def train_arch_jepa(
     )
     (run_dir / "config.json").write_text(json.dumps(cfg, indent=2))
 
-    def forward_one_window(f_w, a_w):
-        """Run encoder+rollout+decoder on a window batch. Returns:
-            pl: scalar pred MSE loss
-            dec_loss_mean: scalar perclass CE loss (for backprop)
-            per_window_dec: (B,) per-window mean per-pixel CE (for priority signal)
-        """
+    def _one_rollout(emb, act_emb, B_, T_, C_, H_, W_, f_w):
+        """Single rollout. Returns (pred_loss, dec_loss_full, per_window_dec, commit, kl)."""
         import torch.nn.functional as F
-        B_, T_, C_, H_, W_ = f_w.shape
-        emb = enc(f_w.reshape(B_ * T_, C_, H_, W_))
-        if is_spatial:
-            emb = emb.view(B_, T_, dim, emb.size(-2), emb.size(-1))
-        else:
-            emb = emb.view(B_, T_, dim)
-        act_emb = action_embed(a_w)
         z_hat = [emb[:, 0]]
         commit_loss_total = z_hat[0].new_zeros(())
         kl_loss_total = z_hat[0].new_zeros(())
@@ -551,27 +541,73 @@ def train_arch_jepa(
         else:
             raw = dec(z_for_dec.reshape(B_ * T_, dim))
         pix_target = f_w.reshape(B_ * T_, C_, H_, W_)
-        # Backprop loss: global perclass CE + optional entropy regularization
-        dec_loss_mean = oracle_decoder_loss(
+        # Per-window NLL for best-of-K and priority
+        p = palette_t.view(1, palette_t.size(0), 3, 1, 1).to(pix_target.dtype)
+        labels = (pix_target.unsqueeze(1) - p).pow(2).sum(dim=2).argmin(dim=1)
+        log_probs_full = F.log_softmax(raw, dim=1)
+        nll_full = -log_probs_full.gather(1, labels.unsqueeze(1)).squeeze(1)        # (B*T, H, W)
+        per_window_nll = nll_full.view(B_, T_, H_, W_).mean(dim=(1, 2, 3))           # (B,)
+        # Full perclass CE for backprop
+        dec_loss_full = oracle_decoder_loss(
             raw, pix_target, loss_kind, K=K_PALETTE, palette=palette_t,
         )
         if entropy_lambda > 0:
-            log_probs_full = F.log_softmax(raw, dim=1)
-            probs = log_probs_full.exp()
-            entropy_per_pixel = -(probs * log_probs_full).sum(dim=1)              # (B*T, H, W)
-            dec_loss_mean = dec_loss_mean + entropy_lambda * entropy_per_pixel.mean()
+            entropy_per_pixel = -(log_probs_full.exp() * log_probs_full).sum(dim=1)
+            dec_loss_full = dec_loss_full + entropy_lambda * entropy_per_pixel.mean()
+        return pl, dec_loss_full, per_window_nll, commit_loss_total, kl_loss_total
+
+    def forward_one_window(f_w, a_w):
+        """Run encoder+rollout+decoder. Best-of-K over k_samples stochastic rollouts.
+        Returns (pred_loss, dec_loss_mean, per_window_dec)."""
+        B_, T_, C_, H_, W_ = f_w.shape
+        emb = enc(f_w.reshape(B_ * T_, C_, H_, W_))
+        if is_spatial:
+            emb = emb.view(B_, T_, dim, emb.size(-2), emb.size(-1))
+        else:
+            emb = emb.view(B_, T_, dim)
+        act_emb = action_embed(a_w)
+
+        if k_samples <= 1:
+            pl, dec_loss_full, per_window_nll, commit_t, kl_t = _one_rollout(
+                emb, act_emb, B_, T_, C_, H_, W_, f_w
+            )
+            dec_loss_mean = dec_loss_full
+            if vq is not None:
+                dec_loss_mean = dec_loss_mean + commit_t / max(T_ - 1, 1)
+            if effective_pred_kind == "variational" and kl_lambda > 0:
+                dec_loss_mean = dec_loss_mean + kl_lambda * (kl_t / max(T_ - 1, 1))
+            return pl, dec_loss_mean, per_window_nll.detach()
+
+        # best-of-K: K rollouts, take min per-window NLL → backprop only through best sample
+        per_w_list = []
+        full_list = []
+        commit_list = []
+        kl_list = []
+        pl_list = []
+        for _ in range(k_samples):
+            pl_k, dec_full_k, per_w_k, commit_k, kl_k = _one_rollout(
+                emb, act_emb, B_, T_, C_, H_, W_, f_w
+            )
+            per_w_list.append(per_w_k)
+            full_list.append(dec_full_k)
+            commit_list.append(commit_k)
+            kl_list.append(kl_k)
+            pl_list.append(pl_k)
+        per_w_stack = torch.stack(per_w_list, dim=0)                              # (K, B)
+        # min over K per window: gradient flows only through the winning sample
+        best_per_w, best_idx = per_w_stack.min(dim=0)                              # (B,)
+        # full perclass loss: weighted by which sample won (one-hot at best_idx)
+        # — implemented as taking the full_list entry at each batch index; since full_list
+        #   are scalars (averaged over the batch already), use min of those scalars instead
+        full_stack = torch.stack(full_list)                                        # (K,)
+        dec_loss_mean = full_stack.min()
+        # kl/commit: avg across all samples (regularization always applied)
         if vq is not None:
-            dec_loss_mean = dec_loss_mean + commit_loss_total / max(T_ - 1, 1)
-        if is_variational and kl_lambda > 0:
-            dec_loss_mean = dec_loss_mean + kl_lambda * (kl_loss_total / max(T_ - 1, 1))
-        # Priority signal: per-window mean per-pixel CE (vectorized, no_grad)
-        with torch.no_grad():
-            p = palette_t.view(1, palette_t.size(0), 3, 1, 1).to(pix_target.dtype)
-            labels = (pix_target.unsqueeze(1) - p).pow(2).sum(dim=2).argmin(dim=1)   # (B*T, H, W)
-            log_probs = F.log_softmax(raw.float(), dim=1)
-            nll = -log_probs.gather(1, labels.unsqueeze(1)).squeeze(1)               # (B*T, H, W)
-            per_window_dec = nll.view(B_, T_, H_, W_).mean(dim=(1, 2, 3))           # (B,)
-        return pl, dec_loss_mean, per_window_dec
+            dec_loss_mean = dec_loss_mean + (sum(commit_list) / max(T_ - 1, 1)) / k_samples
+        if effective_pred_kind == "variational" and kl_lambda > 0:
+            dec_loss_mean = dec_loss_mean + kl_lambda * (sum(kl_list) / max(T_ - 1, 1)) / k_samples
+        pl_mean = sum(pl_list) / k_samples
+        return pl_mean, dec_loss_mean, best_per_w.detach()
 
     train_t0 = time.time()
     for epoch in range(epochs):
@@ -666,16 +702,17 @@ def train_arch_jepa(
 # stochastic predictor + entropy reg. Force commitment via discrete VQ codes:
 # predictor's continuous output is snapped to ONE of K codes per cell.
 # Different K and combos to find sweet spot.
-# Variational predictor: outputs (μ,σ) per cell, samples z via reparameterization,
-# KL regularizes noise channel. Forces predictor to commit to ONE concrete future
-# instead of averaging over plausible food respawn positions.
+# Generic non-cheat commitment ablation: best-of-K + KL strength.
+# All variational predictor + spatial-64 (1:1 latent) + grid_cells=64.
+# Best-of-K trains predictor to produce AT LEAST ONE good sample per window
+# instead of averaging across plausible futures — forces commitment via the loss.
 ARCH_RUNS = [
-    # (run_name,        grid, pred_override,  fsq_L, kl_lambda)
-    ("var-g64",         64,   "variational",  0,     0.01),
-    ("var-g64-kl001",   64,   "variational",  0,     0.001),
-    ("var-g16",         16,   "variational",  0,     0.01),
-    ("var-g16-fsq5",    16,   "variational",  5,     0.01),
-    ("var-g64-fsq5",    64,   "variational",  5,     0.01),
+    # (run_name,        k_samples, kl_lambda, batch)
+    ("gen-ctrl",        1,         0.01,      16),    # control: variational, no best-of-K
+    ("gen-best4",       4,         0.01,      4),     # best-of-4 (memory: 4*1/4=1x base)
+    ("gen-best4-kl1",   4,         1.0,       4),     # best-of-4 + much higher KL
+    ("gen-kl10",        1,         10.0,      16),    # very high KL only (no best-of-K)
+    ("gen-best8",       8,         0.01,      2),     # best-of-8 (extreme commit pressure)
 ]
 
 
@@ -1523,23 +1560,23 @@ def train_manifold(
 
 @app.local_entrypoint()
 def main():
-    print(f"Spawning {len(ARCH_RUNS)} parallel H100 jobs (variational predictor + spatial-64) ...")
-    for run_name, gc, pred_override, fsq_L, kl_l in ARCH_RUNS:
+    print(f"Spawning {len(ARCH_RUNS)} parallel H100 jobs (best-of-K + KL ablation) ...")
+    for run_name, k_s, kl_l, bs in ARCH_RUNS:
         h = train_arch_jepa.spawn(
             run_name=run_name, arch_kind="spatial-64",
             rollout_dec=True, pred_lambda=0.0,
             history=1, pred_horizon=24,
-            latent_noise=0.01, batch=16,
+            latent_noise=0.01, batch=bs,
             num_episodes=1500,
             steps_per_epoch_cap=200,
             hard_mining="prio", prio_alpha=1.0,
             dec_kind="pixshuf", entropy_lambda=0.3,
-            predictor_kind_override=pred_override,
+            predictor_kind_override="variational",
             pred_blocks=2, pred_hidden=64,
-            fsq_levels=fsq_L, grid_cells=gc,
-            kl_lambda=kl_l,
+            fsq_levels=0, grid_cells=64,
+            kl_lambda=kl_l, k_samples=k_s,
         )
-        print(f"  spawned {run_name} (grid={gc}, pred={pred_override}, fsq_L={fsq_L}, kl={kl_l}): {h.object_id}")
+        print(f"  spawned {run_name} (k={k_s}, kl={kl_l}, batch={bs}): {h.object_id}")
     print("All jobs spawned.")
     return
     # legacy entrypoint below

@@ -363,6 +363,8 @@ def train_arch_jepa(
                                      # Generic version of "top-K-per-class" hack — model LEARNS sparsity.
     global_noise_dim: int = 0,      # variational predictor: also broadcast a global ε per rollout step.
                                      # Lets one ε determine global modes (e.g., random food respawn position).
+    bound_latent: bool = False,     # tanh on encoder + predictor outputs → bounded latents → stable pred_loss.
+                                     # Required for pure JEPA (pred_lambda > 0 without exploding latents).
 ):
     """Full JEPA system with spatial latent: encoder + ConvPredictor + decoder.
     Trains on T-step windows with both pred MSE in latent space and dec CE in pixel space.
@@ -520,6 +522,7 @@ def train_arch_jepa(
         vq_K=vq_K, fsq_levels=fsq_levels, grid_cells=grid_cells,
         global_noise_dim=global_noise_dim, count_lambda=count_lambda, k_samples=k_samples,
         kl_lambda=kl_lambda,
+        bound_latent=bound_latent, pred_lambda=pred_lambda,
     )
     (run_dir / "config.json").write_text(json.dumps(cfg, indent=2))
 
@@ -536,6 +539,8 @@ def train_arch_jepa(
                 kl_loss_total = kl_loss_total + kl_t
             else:
                 z_next = pred(z_hat[-1], act_emb[:, t])
+            if bound_latent:
+                z_next = z_next.tanh()
             if latent_noise > 0:
                 z_next = z_next + latent_noise * torch.randn_like(z_next)
             if vq is not None:
@@ -583,6 +588,8 @@ def train_arch_jepa(
         Returns (pred_loss, dec_loss_mean, per_window_dec)."""
         B_, T_, C_, H_, W_ = f_w.shape
         emb = enc(f_w.reshape(B_ * T_, C_, H_, W_))
+        if bound_latent:
+            emb = emb.tanh()
         if is_spatial:
             emb = emb.view(B_, T_, dim, emb.size(-2), emb.size(-1))
         else:
@@ -729,17 +736,18 @@ def train_arch_jepa(
 # Best-of-K trains predictor to produce AT LEAST ONE good sample per window
 # instead of averaging across plausible futures — forces commitment via the loss.
 ARCH_CONFIGS = [
-    # (config_name,         k_samples, kl_lambda, count_lambda, global_noise_dim, batch)
-    ("rs-ctrl",             4,         0.01,      10.0,         0,                4),    # baseline (cnt-w10-best4)
-    ("rs-globalN",          4,         0.01,      10.0,         16,               4),    # + global noise channel only
-    ("rs-bigK16",           16,        0.01,      10.0,         0,                1),    # + best-of-16 only (huge sample pressure)
-    ("rs-kl1",              4,         1.0,       10.0,         0,                4),    # + KL=1.0 only (force σ ≈ 1)
-    ("rs-all",              16,        1.0,       10.0,         16,               1),    # all three combined
+    # JEPA-vs-current comparison. All on variational predictor + count loss + grid_cells (×2).
+    # cfg_name,            pred_lambda, rollout_dec, bound_latent, k_samples, count, batch
+    ("cmp-cur",            0.0,         True,        False,         1,         10.0,  16),  # current end-to-end (NOT JEPA)
+    ("cmp-jepa-pure",      1.0,         False,       True,          1,         10.0,  16),  # PURE JEPA: pred MSE in latent, dec on enc only, tanh-bounded
+    ("cmp-jepa-hybrid",    1.0,         True,        True,          1,         10.0,  16),  # JEPA pred + dec on rollout (both)
+    ("cmp-jepa-pure-bk4",  1.0,         False,       True,          4,         10.0,  4),   # PURE JEPA + best-of-4
+    ("cmp-jepa-pure-cnt",  1.0,         False,       True,          1,         100.0, 16),  # PURE JEPA + heavy count loss
 ]
-# Expand to (run_name, grid_cells, k, kl, count, gnoise, batch) over both grid sizes
+# Expand each config × 2 grid sizes
 ARCH_RUNS = [
-    (f"{cfg_name}-g{gc}", gc, k, kl, cnt, gnoise, bs)
-    for (cfg_name, k, kl, cnt, gnoise, bs) in ARCH_CONFIGS
+    (f"{cfg_name}-g{gc}", gc, pl, rd, bl, ks, cnt, bs)
+    for (cfg_name, pl, rd, bl, ks, cnt, bs) in ARCH_CONFIGS
     for gc in (64, 16)
 ]
 
@@ -1588,11 +1596,11 @@ def train_manifold(
 
 @app.local_entrypoint()
 def main():
-    print(f"Spawning {len(ARCH_RUNS)} parallel H100 jobs (respawn fix isolation × 2 grid sizes) ...")
-    for run_name, gc, k_s, kl_l, cnt_l, gnoise, bs in ARCH_RUNS:
+    print(f"Spawning {len(ARCH_RUNS)} parallel H100 jobs (JEPA vs current comparison × 2 grids) ...")
+    for run_name, gc, pl, rd, bl, ks, cnt_l, bs in ARCH_RUNS:
         h = train_arch_jepa.spawn(
             run_name=run_name, arch_kind="spatial-64",
-            rollout_dec=True, pred_lambda=0.0,
+            rollout_dec=rd, pred_lambda=pl,
             history=1, pred_horizon=24,
             latent_noise=0.01, batch=bs,
             num_episodes=1500,
@@ -1602,10 +1610,10 @@ def main():
             predictor_kind_override="variational",
             pred_blocks=2, pred_hidden=64,
             fsq_levels=0, grid_cells=gc,
-            kl_lambda=kl_l, k_samples=k_s, count_lambda=cnt_l,
-            global_noise_dim=gnoise,
+            kl_lambda=0.01, k_samples=ks, count_lambda=cnt_l,
+            global_noise_dim=0, bound_latent=bl,
         )
-        print(f"  spawned {run_name} (grid={gc}, k={k_s}, kl={kl_l}, cnt={cnt_l}, gN={gnoise}): {h.object_id}")
+        print(f"  spawned {run_name} (gc={gc}, pl={pl}, rd={rd}, bl={bl}, k={ks}, cnt={cnt_l}): {h.object_id}")
     print("All jobs spawned.")
     return
     # legacy entrypoint below

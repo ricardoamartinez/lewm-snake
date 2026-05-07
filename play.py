@@ -306,6 +306,8 @@ def run_arch_jepa_play(args, ckpt_path):
             a_t = act_embed(torch.tensor([current_action], device=args.device))
             pred_out = pred(z, a_t)
             z = pred_out[0] if isinstance(pred_out, tuple) else pred_out
+            if cfg.get("bound_latent", False):
+                z = z.tanh()
             if vq is not None:
                 z, _ = vq(z)
             raw_jepa = dec(z)
@@ -982,6 +984,8 @@ def run_combo_play(args):
         f0 = torch.from_numpy(seed_frame).float().permute(2, 0, 1).unsqueeze(0).to(args.device) / 255.0
         with torch.no_grad():
             z0 = m["enc"](f0)
+            if m["cfg"].get("bound_latent", False):
+                z0 = z0.tanh()
         rows.append(dict(run=rn, model=m, env=env, z=z0, grid_cells=gc, class_counts=class_counts))
 
     if not rows:
@@ -1024,6 +1028,8 @@ def run_combo_play(args):
                         f0 = torch.from_numpy(r["env"].render()).float().permute(2, 0, 1).unsqueeze(0).to(args.device) / 255.0
                         with torch.no_grad():
                             r["z"] = r["model"]["enc"](f0)
+                            if r["model"]["cfg"].get("bound_latent", False):
+                                r["z"] = r["z"].tanh()
                     step_idx = 0
                 elif event.key == pygame.K_r:
                     # Reload each row's latest checkpoint from the volume
@@ -1043,6 +1049,8 @@ def run_combo_play(args):
                         f0 = torch.from_numpy(r["env"].render()).float().permute(2, 0, 1).unsqueeze(0).to(args.device) / 255.0
                         with torch.no_grad():
                             r["z"] = r["model"]["enc"](f0)
+                            if r["model"]["cfg"].get("bound_latent", False):
+                                r["z"] = r["z"].tanh()
                         print(f"  {r['run']}: reloaded ep={r['model']['ep']}")
                     pygame.display.set_caption(
                         "LeWM-Snake combo  " + "  ".join(f"{r['run']}:ep{r['model']['ep']}" for r in rows)
@@ -1062,11 +1070,15 @@ def run_combo_play(args):
                 f0 = torch.from_numpy(env.render()).float().permute(2, 0, 1).unsqueeze(0).to(args.device) / 255.0
                 with torch.no_grad():
                     r["z"] = m["enc"](f0)
+                    if m["cfg"].get("bound_latent", False):
+                        r["z"] = r["z"].tanh()
                 continue
             real_frame = env.render()
             real_t = torch.from_numpy(real_frame).float().permute(2, 0, 1).unsqueeze(0).to(args.device) / 255.0
             with torch.no_grad():
                 z_enc = m["enc"](real_t)
+                if m["cfg"].get("bound_latent", False):
+                    z_enc = z_enc.tanh()
                 if m["vq"] is not None:
                     z_enc_q, _ = m["vq"](z_enc)
                 else:
@@ -1080,6 +1092,8 @@ def run_combo_play(args):
                 a_t = m["act_embed"](torch.tensor([current_action], device=args.device))
                 pred_out = m["pred"](r["z"], a_t)
                 z_new = pred_out[0] if isinstance(pred_out, tuple) else pred_out
+                if m["cfg"].get("bound_latent", False):
+                    z_new = z_new.tanh()
                 if m["vq"] is not None:
                     z_new, _ = m["vq"](z_new)
                 r["z"] = z_new

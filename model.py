@@ -509,13 +509,20 @@ class AttnPredictor(nn.Module):
 class VariationalConvPredictor(nn.Module):
     """Variational JEPA conv predictor: outputs (μ, σ) per cell, samples z via
     reparameterization. KL(N(μ,σ)||N(0,I)) regularizes noise channel.
-    Forces the model to use noise to commit to specific futures rather than output
-    the AVERAGE of plausible futures (multi-food artifact root cause).
+
+    With global_noise_dim > 0: ALSO sample one global ε per rollout step, broadcast
+    to all spatial cells. This is the right inductive bias for events that affect
+    a global mode (e.g., "where does the new food appear") — per-cell noise can't
+    coordinate that.
     """
-    def __init__(self, dim: int = 16, hidden: int = 64, n_blocks: int = 2):
+    def __init__(self, dim: int = 16, hidden: int = 64, n_blocks: int = 2,
+                 global_noise_dim: int = 0):
         super().__init__()
         self.dim = dim
+        self.global_noise_dim = global_noise_dim
         self.in_proj = nn.Conv2d(dim, hidden, 3, 1, 1)
+        if global_noise_dim > 0:
+            self.global_proj = nn.Linear(global_noise_dim, hidden)
         self.blocks = nn.ModuleList([
             nn.Sequential(
                 nn.GroupNorm(min(8, hidden), hidden), nn.GELU(),
@@ -530,13 +537,18 @@ class VariationalConvPredictor(nn.Module):
     def forward(self, z, action_emb):
         a = action_emb.unsqueeze(-1).unsqueeze(-1)
         h = self.in_proj(z + a)
+        if self.global_noise_dim > 0:
+            B = z.size(0)
+            g_eps = torch.randn(B, self.global_noise_dim, device=z.device, dtype=z.dtype)
+            g_proj = self.global_proj(g_eps).unsqueeze(-1).unsqueeze(-1)        # (B, hidden, 1, 1)
+            h = h + g_proj
         for blk in self.blocks:
             h = h + blk(h)
         mu = self.mu_out(h)
         logsig = self.logsig_out(h).clamp(-5.0, 2.0)
         sig = logsig.exp()
         eps = torch.randn_like(mu)
-        z_next = z + mu + sig * eps                                          # residual + reparam
+        z_next = z + mu + sig * eps                                            # residual + reparam
         # KL(N(mu, sig^2) || N(0, 1)) per element, mean over cells/channels
         kl = 0.5 * (mu.pow(2) + sig.pow(2) - 2.0 * logsig - 1.0).mean()
         return z_next, kl
@@ -1019,7 +1031,9 @@ def render_oracle_output(raw, loss_kind, K=None, palette=None):
         colors = SNAKE_COLORS.to(raw.device, dtype=raw.dtype)
         return colors[labels].permute(0, 3, 1, 2)
     if loss_kind in ("cat-kmeans", "cat-kmeans-unique", "cat-kmeans-focal", "cat-kmeans-weighted", "cat-kmeans-fgonly", "cat-kmeans-perclass", "cat-kmeans-perclass-focal"):
-        labels = raw.argmax(dim=1)
+        # argmax only over the REAL palette entries (raw may have padded extras)
+        K_pal = palette.size(0)
+        labels = raw[:, :K_pal].argmax(dim=1)
         colors = palette.to(raw.device, dtype=raw.dtype)
         return colors[labels].permute(0, 3, 1, 2)
     if loss_kind == "mol":

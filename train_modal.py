@@ -361,6 +361,8 @@ def train_arch_jepa(
     k_samples: int = 1,             # best-of-K: do K stochastic rollouts, train on min(loss). Forces commit.
     count_lambda: float = 0.0,      # per-class count loss: model's expected count must match GT count.
                                      # Generic version of "top-K-per-class" hack — model LEARNS sparsity.
+    global_noise_dim: int = 0,      # variational predictor: also broadcast a global ε per rollout step.
+                                     # Lets one ε determine global modes (e.g., random food respawn position).
 ):
     """Full JEPA system with spatial latent: encoder + ConvPredictor + decoder.
     Trains on T-step windows with both pred MSE in latent space and dec CE in pixel space.
@@ -477,7 +479,10 @@ def train_arch_jepa(
     elif effective_pred_kind == "attn-stoch":
         pred = AttnPredictor(dim=dim, hidden=pred_hidden, n_blocks=pred_blocks, stochastic=True).to(device)
     elif effective_pred_kind == "variational":
-        pred = VariationalConvPredictor(dim=dim, hidden=pred_hidden, n_blocks=pred_blocks).to(device)
+        pred = VariationalConvPredictor(
+            dim=dim, hidden=pred_hidden, n_blocks=pred_blocks,
+            global_noise_dim=global_noise_dim,
+        ).to(device)
     else:
         pred = make_predictor(effective_pred_kind, dim=dim).to(device)
     pred_kind = effective_pred_kind
@@ -513,6 +518,8 @@ def train_arch_jepa(
         hard_mining=hard_mining, prio_alpha=prio_alpha,
         pred_blocks=pred_blocks, pred_hidden=pred_hidden,
         vq_K=vq_K, fsq_levels=fsq_levels, grid_cells=grid_cells,
+        global_noise_dim=global_noise_dim, count_lambda=count_lambda, k_samples=k_samples,
+        kl_lambda=kl_lambda,
     )
     (run_dir / "config.json").write_text(json.dumps(cfg, indent=2))
 
@@ -722,17 +729,17 @@ def train_arch_jepa(
 # Best-of-K trains predictor to produce AT LEAST ONE good sample per window
 # instead of averaging across plausible futures — forces commitment via the loss.
 ARCH_CONFIGS = [
-    # (config_name,         k_samples, kl_lambda, count_lambda, batch)
-    ("cnt-ctrl",            1,         0.01,      0.0,           16),  # control (no count loss)
-    ("cnt-w1",              1,         0.01,      1.0,           16),
-    ("cnt-w10",             1,         0.01,      10.0,          16),
-    ("cnt-w100",            1,         0.01,      100.0,         16),
-    ("cnt-w10-best4",       4,         0.01,      10.0,          4),   # count + best-of-4
+    # (config_name,         k_samples, kl_lambda, count_lambda, global_noise_dim, batch)
+    ("rs-ctrl",             4,         0.01,      10.0,         0,                4),    # baseline (cnt-w10-best4)
+    ("rs-globalN",          4,         0.01,      10.0,         16,               4),    # + global noise channel only
+    ("rs-bigK16",           16,        0.01,      10.0,         0,                1),    # + best-of-16 only (huge sample pressure)
+    ("rs-kl1",              4,         1.0,       10.0,         0,                4),    # + KL=1.0 only (force σ ≈ 1)
+    ("rs-all",              16,        1.0,       10.0,         16,               1),    # all three combined
 ]
-# Expand to (run_name, grid_cells, k, kl, count, batch) over both grid sizes
+# Expand to (run_name, grid_cells, k, kl, count, gnoise, batch) over both grid sizes
 ARCH_RUNS = [
-    (f"{cfg_name}-g{gc}", gc, k, kl, cnt, bs)
-    for (cfg_name, k, kl, cnt, bs) in ARCH_CONFIGS
+    (f"{cfg_name}-g{gc}", gc, k, kl, cnt, gnoise, bs)
+    for (cfg_name, k, kl, cnt, gnoise, bs) in ARCH_CONFIGS
     for gc in (64, 16)
 ]
 
@@ -1581,8 +1588,8 @@ def train_manifold(
 
 @app.local_entrypoint()
 def main():
-    print(f"Spawning {len(ARCH_RUNS)} parallel H100 jobs (count loss × 2 grid sizes) ...")
-    for run_name, gc, k_s, kl_l, cnt_l, bs in ARCH_RUNS:
+    print(f"Spawning {len(ARCH_RUNS)} parallel H100 jobs (respawn fix isolation × 2 grid sizes) ...")
+    for run_name, gc, k_s, kl_l, cnt_l, gnoise, bs in ARCH_RUNS:
         h = train_arch_jepa.spawn(
             run_name=run_name, arch_kind="spatial-64",
             rollout_dec=True, pred_lambda=0.0,
@@ -1596,8 +1603,9 @@ def main():
             pred_blocks=2, pred_hidden=64,
             fsq_levels=0, grid_cells=gc,
             kl_lambda=kl_l, k_samples=k_s, count_lambda=cnt_l,
+            global_noise_dim=gnoise,
         )
-        print(f"  spawned {run_name} (grid={gc}, k={k_s}, kl={kl_l}, cnt={cnt_l}): {h.object_id}")
+        print(f"  spawned {run_name} (grid={gc}, k={k_s}, kl={kl_l}, cnt={cnt_l}, gN={gnoise}): {h.object_id}")
     print("All jobs spawned.")
     return
     # legacy entrypoint below

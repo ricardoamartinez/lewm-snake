@@ -203,7 +203,8 @@ def run_arch_jepa_play(args, ckpt_path):
     elif pred_kind == "attn-stoch":
         pred = AttnPredictor(dim=dim, hidden=phid, n_blocks=pb, stochastic=True)
     elif pred_kind == "variational":
-        pred = VariationalConvPredictor(dim=dim, hidden=phid, n_blocks=pb)
+        gnd = cfg.get("global_noise_dim", 0)
+        pred = VariationalConvPredictor(dim=dim, hidden=phid, n_blocks=pb, global_noise_dim=gnd)
     else:
         pred = make_predictor(pred_kind, dim=dim)
     pred.load_state_dict(blob["predictor_state"]); pred.eval()
@@ -880,7 +881,8 @@ def _build_arch_jepa_model(blob, device):
     elif pred_kind == "attn-stoch":
         pred = AttnPredictor(dim=dim, hidden=phid, n_blocks=pb, stochastic=True)
     elif pred_kind == "variational":
-        pred = VariationalConvPredictor(dim=dim, hidden=phid, n_blocks=pb)
+        gnd = cfg.get("global_noise_dim", 0)
+        pred = VariationalConvPredictor(dim=dim, hidden=phid, n_blocks=pb, global_noise_dim=gnd)
     else:
         pred = make_predictor(pred_kind, dim=dim)
     pred.load_state_dict(blob["predictor_state"]); pred.eval()

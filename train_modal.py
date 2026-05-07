@@ -359,6 +359,8 @@ def train_arch_jepa(
     grid_cells: int = 64,           # snake game grid (16 = chunky 4px cells, 64 = 1px cells)
     kl_lambda: float = 0.0,         # variational KL weight (only used with variational predictor)
     k_samples: int = 1,             # best-of-K: do K stochastic rollouts, train on min(loss). Forces commit.
+    count_lambda: float = 0.0,      # per-class count loss: model's expected count must match GT count.
+                                     # Generic version of "top-K-per-class" hack — model LEARNS sparsity.
 ):
     """Full JEPA system with spatial latent: encoder + ConvPredictor + decoder.
     Trains on T-step windows with both pred MSE in latent space and dec CE in pixel space.
@@ -554,6 +556,19 @@ def train_arch_jepa(
         if entropy_lambda > 0:
             entropy_per_pixel = -(log_probs_full.exp() * log_probs_full).sum(dim=1)
             dec_loss_full = dec_loss_full + entropy_lambda * entropy_per_pixel.mean()
+        # Count-matching loss: per-class softmax sum should match GT count per frame.
+        # Generic enforcement of "exactly N pixels of class C" without hardcoding N.
+        if count_lambda > 0:
+            K_pal = palette_t.size(0)
+            probs = log_probs_full.exp()                                    # (B*T, K_logits, H, W)
+            pred_counts = probs[:, :K_pal].sum(dim=(-2, -1))                 # (B*T, K_pal)
+            gt_oh = F.one_hot(labels, num_classes=K_pal).to(probs.dtype)     # (B*T, H, W, K_pal)
+            gt_counts = gt_oh.sum(dim=(-3, -2))                              # (B*T, K_pal)
+            # MSE on log-counts so rare classes get equal weight to common ones
+            count_loss = F.mse_loss(
+                (pred_counts + 1.0).log(), (gt_counts + 1.0).log()
+            )
+            dec_loss_full = dec_loss_full + count_lambda * count_loss
         return pl, dec_loss_full, per_window_nll, commit_loss_total, kl_loss_total
 
     def forward_one_window(f_w, a_w):
@@ -707,17 +722,17 @@ def train_arch_jepa(
 # Best-of-K trains predictor to produce AT LEAST ONE good sample per window
 # instead of averaging across plausible futures — forces commitment via the loss.
 ARCH_CONFIGS = [
-    # (config_name,      k_samples, kl_lambda, batch)
-    ("gen-ctrl",         1,         0.01,      16),
-    ("gen-best4",        4,         0.01,      4),
-    ("gen-best4-kl1",    4,         1.0,       4),
-    ("gen-kl10",         1,         10.0,      16),
-    ("gen-best8",        8,         0.01,      2),
+    # (config_name,         k_samples, kl_lambda, count_lambda, batch)
+    ("cnt-ctrl",            1,         0.01,      0.0,           16),  # control (no count loss)
+    ("cnt-w1",              1,         0.01,      1.0,           16),
+    ("cnt-w10",             1,         0.01,      10.0,          16),
+    ("cnt-w100",            1,         0.01,      100.0,         16),
+    ("cnt-w10-best4",       4,         0.01,      10.0,          4),   # count + best-of-4
 ]
-# Expand to (run_name, grid_cells, k, kl, batch) over both grid sizes
+# Expand to (run_name, grid_cells, k, kl, count, batch) over both grid sizes
 ARCH_RUNS = [
-    (f"{cfg_name}-g{gc}", gc, k, kl, bs)
-    for (cfg_name, k, kl, bs) in ARCH_CONFIGS
+    (f"{cfg_name}-g{gc}", gc, k, kl, cnt, bs)
+    for (cfg_name, k, kl, cnt, bs) in ARCH_CONFIGS
     for gc in (64, 16)
 ]
 
@@ -1566,8 +1581,8 @@ def train_manifold(
 
 @app.local_entrypoint()
 def main():
-    print(f"Spawning {len(ARCH_RUNS)} parallel H100 jobs (best-of-K + KL × 2 grid sizes) ...")
-    for run_name, gc, k_s, kl_l, bs in ARCH_RUNS:
+    print(f"Spawning {len(ARCH_RUNS)} parallel H100 jobs (count loss × 2 grid sizes) ...")
+    for run_name, gc, k_s, kl_l, cnt_l, bs in ARCH_RUNS:
         h = train_arch_jepa.spawn(
             run_name=run_name, arch_kind="spatial-64",
             rollout_dec=True, pred_lambda=0.0,
@@ -1580,9 +1595,9 @@ def main():
             predictor_kind_override="variational",
             pred_blocks=2, pred_hidden=64,
             fsq_levels=0, grid_cells=gc,
-            kl_lambda=kl_l, k_samples=k_s,
+            kl_lambda=kl_l, k_samples=k_s, count_lambda=cnt_l,
         )
-        print(f"  spawned {run_name} (grid={gc}, k={k_s}, kl={kl_l}, bs={bs}): {h.object_id}")
+        print(f"  spawned {run_name} (grid={gc}, k={k_s}, kl={kl_l}, cnt={cnt_l}): {h.object_id}")
     print("All jobs spawned.")
     return
     # legacy entrypoint below

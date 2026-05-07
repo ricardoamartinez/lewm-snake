@@ -703,16 +703,22 @@ def train_arch_jepa(
 # predictor's continuous output is snapped to ONE of K codes per cell.
 # Different K and combos to find sweet spot.
 # Generic non-cheat commitment ablation: best-of-K + KL strength.
-# All variational predictor + spatial-64 (1:1 latent) + grid_cells=64.
+# 5 configs × 2 grid sizes = 10 jobs. Each window shows 8 panes (2 rows × 4 panes).
 # Best-of-K trains predictor to produce AT LEAST ONE good sample per window
 # instead of averaging across plausible futures — forces commitment via the loss.
+ARCH_CONFIGS = [
+    # (config_name,      k_samples, kl_lambda, batch)
+    ("gen-ctrl",         1,         0.01,      16),
+    ("gen-best4",        4,         0.01,      4),
+    ("gen-best4-kl1",    4,         1.0,       4),
+    ("gen-kl10",         1,         10.0,      16),
+    ("gen-best8",        8,         0.01,      2),
+]
+# Expand to (run_name, grid_cells, k, kl, batch) over both grid sizes
 ARCH_RUNS = [
-    # (run_name,        k_samples, kl_lambda, batch)
-    ("gen-ctrl",        1,         0.01,      16),    # control: variational, no best-of-K
-    ("gen-best4",       4,         0.01,      4),     # best-of-4 (memory: 4*1/4=1x base)
-    ("gen-best4-kl1",   4,         1.0,       4),     # best-of-4 + much higher KL
-    ("gen-kl10",        1,         10.0,      16),    # very high KL only (no best-of-K)
-    ("gen-best8",       8,         0.01,      2),     # best-of-8 (extreme commit pressure)
+    (f"{cfg_name}-g{gc}", gc, k, kl, bs)
+    for (cfg_name, k, kl, bs) in ARCH_CONFIGS
+    for gc in (64, 16)
 ]
 
 
@@ -1560,8 +1566,8 @@ def train_manifold(
 
 @app.local_entrypoint()
 def main():
-    print(f"Spawning {len(ARCH_RUNS)} parallel H100 jobs (best-of-K + KL ablation) ...")
-    for run_name, k_s, kl_l, bs in ARCH_RUNS:
+    print(f"Spawning {len(ARCH_RUNS)} parallel H100 jobs (best-of-K + KL × 2 grid sizes) ...")
+    for run_name, gc, k_s, kl_l, bs in ARCH_RUNS:
         h = train_arch_jepa.spawn(
             run_name=run_name, arch_kind="spatial-64",
             rollout_dec=True, pred_lambda=0.0,
@@ -1573,10 +1579,10 @@ def main():
             dec_kind="pixshuf", entropy_lambda=0.3,
             predictor_kind_override="variational",
             pred_blocks=2, pred_hidden=64,
-            fsq_levels=0, grid_cells=64,
+            fsq_levels=0, grid_cells=gc,
             kl_lambda=kl_l, k_samples=k_s,
         )
-        print(f"  spawned {run_name} (k={k_s}, kl={kl_l}, batch={bs}): {h.object_id}")
+        print(f"  spawned {run_name} (grid={gc}, k={k_s}, kl={kl_l}, bs={bs}): {h.object_id}")
     print("All jobs spawned.")
     return
     # legacy entrypoint below

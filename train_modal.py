@@ -331,40 +331,37 @@ def train_predictor(
 )
 def train_arch_jepa(
     run_name: str,
-    arch_kind: str,             # "flat", "spatial-16", "spatial-8", "spatial-4"
+    arch_kind: str = "spatial-64",   # 1:1 latent (one cell per pixel), no upsample blur
     loss_kind: str = "cat-kmeans-perclass",
     epochs: int = 100,
-    batch: int = 128,
+    batch: int = 16,                  # spatial-64 + T=24 fits at batch=16 on H100
     lr: float = 5e-4,
     num_episodes: int = 1500,
-    history: int = 4,
-    pred_horizon: int = 4,
+    history: int = 1,
+    pred_horizon: int = 24,           # long enough for play-time rollouts without OOM
     dim: int = 16,
     seed: int = 0,
-    pred_lambda: float = 1.0,
+    # ---- DEFAULTS = PURE JEPA RECIPE (canonical method) ----
+    pred_lambda: float = 1.0,       # JEPA latent-space MSE (predictor's only training signal)
     dec_lambda: float = 1.0,
-    rollout_dec: bool = True,   # if True, decoder loss is on PREDICTED latents (option B);
-                                 # if False, on encoded latents (option A — manifold-locked)
-    latent_noise: float = 0.0,  # noise added to predicted latents during rollout (drift robustness)
-    pred_blocks: int = 2,       # depth of ConvPredictor
-    pred_hidden: int = 64,      # width of ConvPredictor
-    hard_mining: str = "none",  # "none", "prio", "topk2x"
-    prio_alpha: float = 1.0,    # priority exponent for "prio" mode (0=uniform, larger=more aggressive)
-    entropy_lambda: float = 0.0,  # entropy regularization on decoder output (penalizes hedged softmax)
-    dec_kind: str = "convt",      # "convt" or "pixshuf"
-    predictor_kind_override: str = "",  # "" = auto, "stoch-conv" = stochastic conv predictor
-    steps_per_epoch_cap: int = 0,  # if > 0, sample only this many batches per epoch (fast iter)
-    vq_K: int = 0,                  # if > 0, apply VQ with K codes between predictor and decoder
-    fsq_levels: int = 0,            # if > 0, apply FSQ with L levels per dim (more stable than VQ)
-    grid_cells: int = 64,           # snake game grid (16 = chunky 4px cells, 64 = 1px cells)
-    kl_lambda: float = 0.0,         # variational KL weight (only used with variational predictor)
-    k_samples: int = 1,             # best-of-K: do K stochastic rollouts, train on min(loss). Forces commit.
-    count_lambda: float = 0.0,      # per-class count loss: model's expected count must match GT count.
-                                     # Generic version of "top-K-per-class" hack — model LEARNS sparsity.
-    global_noise_dim: int = 0,      # variational predictor: also broadcast a global ε per rollout step.
-                                     # Lets one ε determine global modes (e.g., random food respawn position).
-    bound_latent: bool = False,     # tanh on encoder + predictor outputs → bounded latents → stable pred_loss.
-                                     # Required for pure JEPA (pred_lambda > 0 without exploding latents).
+    rollout_dec: bool = False,      # PURE JEPA: dec on encoder, NOT on rollout. Predictor never gets pixel grad.
+    bound_latent: bool = True,      # tanh on encoder + predictor outputs → bounded latents → stable pred_loss
+    latent_noise: float = 0.0,
+    pred_blocks: int = 2,
+    pred_hidden: int = 64,
+    hard_mining: str = "prio",      # prioritized replay (rare-event coverage)
+    prio_alpha: float = 1.0,
+    entropy_lambda: float = 0.3,    # mild output entropy regularization
+    dec_kind: str = "pixshuf",      # PixelShuffle decoder (sub-pixel reorder, no upsample blur)
+    predictor_kind_override: str = "variational",   # variational conv predictor (μ, σ + reparam + KL)
+    steps_per_epoch_cap: int = 200, # ~50s/epoch on H100 with spatial-64
+    vq_K: int = 0,
+    fsq_levels: int = 0,
+    grid_cells: int = 64,
+    kl_lambda: float = 0.01,        # mild KL for variational predictor
+    k_samples: int = 1,
+    count_lambda: float = 100.0,    # heavy count loss: model learns sparsity from data (no hack)
+    global_noise_dim: int = 0,
 ):
     """Full JEPA system with spatial latent: encoder + ConvPredictor + decoder.
     Trains on T-step windows with both pred MSE in latent space and dec CE in pixel space.
@@ -735,20 +732,12 @@ def train_arch_jepa(
 # 5 configs × 2 grid sizes = 10 jobs. Each window shows 8 panes (2 rows × 4 panes).
 # Best-of-K trains predictor to produce AT LEAST ONE good sample per window
 # instead of averaging across plausible futures — forces commitment via the loss.
-ARCH_CONFIGS = [
-    # JEPA-vs-current comparison. All on variational predictor + count loss + grid_cells (×2).
-    # cfg_name,            pred_lambda, rollout_dec, bound_latent, k_samples, count, batch
-    ("cmp-cur",            0.0,         True,        False,         1,         10.0,  16),  # current end-to-end (NOT JEPA)
-    ("cmp-jepa-pure",      1.0,         False,       True,          1,         10.0,  16),  # PURE JEPA: pred MSE in latent, dec on enc only, tanh-bounded
-    ("cmp-jepa-hybrid",    1.0,         True,        True,          1,         10.0,  16),  # JEPA pred + dec on rollout (both)
-    ("cmp-jepa-pure-bk4",  1.0,         False,       True,          4,         10.0,  4),   # PURE JEPA + best-of-4
-    ("cmp-jepa-pure-cnt",  1.0,         False,       True,          1,         100.0, 16),  # PURE JEPA + heavy count loss
-]
-# Expand each config × 2 grid sizes
+# Canonical method: PURE JEPA (cmp-jepa-pure-cnt setup).
+# Defaults in train_arch_jepa already match this. Just spawn it at both grid sizes.
 ARCH_RUNS = [
-    (f"{cfg_name}-g{gc}", gc, pl, rd, bl, ks, cnt, bs)
-    for (cfg_name, pl, rd, bl, ks, cnt, bs) in ARCH_CONFIGS
-    for gc in (64, 16)
+    # (run_name, grid_cells)
+    ("jepa-g64",  64),
+    ("jepa-g16",  16),
 ]
 
 
@@ -1596,24 +1585,11 @@ def train_manifold(
 
 @app.local_entrypoint()
 def main():
-    print(f"Spawning {len(ARCH_RUNS)} parallel H100 jobs (JEPA vs current comparison × 2 grids) ...")
-    for run_name, gc, pl, rd, bl, ks, cnt_l, bs in ARCH_RUNS:
-        h = train_arch_jepa.spawn(
-            run_name=run_name, arch_kind="spatial-64",
-            rollout_dec=rd, pred_lambda=pl,
-            history=1, pred_horizon=24,
-            latent_noise=0.01, batch=bs,
-            num_episodes=1500,
-            steps_per_epoch_cap=200,
-            hard_mining="prio", prio_alpha=1.0,
-            dec_kind="pixshuf", entropy_lambda=0.3,
-            predictor_kind_override="variational",
-            pred_blocks=2, pred_hidden=64,
-            fsq_levels=0, grid_cells=gc,
-            kl_lambda=0.01, k_samples=ks, count_lambda=cnt_l,
-            global_noise_dim=0, bound_latent=bl,
-        )
-        print(f"  spawned {run_name} (gc={gc}, pl={pl}, rd={rd}, bl={bl}, k={ks}, cnt={cnt_l}): {h.object_id}")
+    print(f"Spawning {len(ARCH_RUNS)} parallel H100 jobs (PURE JEPA — canonical method) ...")
+    for run_name, gc in ARCH_RUNS:
+        # All other args use the pure-JEPA defaults set in train_arch_jepa
+        h = train_arch_jepa.spawn(run_name=run_name, grid_cells=gc)
+        print(f"  spawned {run_name} (grid_cells={gc}): {h.object_id}")
     print("All jobs spawned.")
     return
     # legacy entrypoint below
